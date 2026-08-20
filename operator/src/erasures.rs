@@ -113,7 +113,7 @@ pub async fn erase(
                     &request.operation_id,
                     &holder.handle,
                     &request.scope,
-                    "erased",
+                    "erasure_acknowledged",
                     Some(serde_json::to_string(&ids).unwrap_or_default()),
                     &stamp,
                 )?;
@@ -556,7 +556,10 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "the erasure could not be reconciled");
         let outcome: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(outcome["outcome"]["status"], "erased");
+        assert_eq!(
+            outcome["outcome"]["status"],
+            "erasure_acknowledged"
+        );
     }
 
     /// Retrying an erase returns the receipt already earned. A 404
@@ -810,7 +813,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the retry could not be reconciled");
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap()["outcome"]["status"],
-            "erased"
+            "erasure_acknowledged"
         );
     }
 

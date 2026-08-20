@@ -75,7 +75,9 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   commit, erase, and orphan cleanup serialize destination changes so a
   concurrent re-upload cannot be unlinked by an erasure.
 - Operation reconciliation authenticates the original percent-encoded request
-  target, and every terms entry in an export carries its own fetchable URL.
+  target, reports erase acceptance as `erasure_acknowledged` rather than the
+  client's later `erased` judgement, and every terms entry in an export carries
+  its own fetchable URL.
 - Existing stores migrate `operation_outcomes.digest` to `subject` and add
   `receiptIds` without losing previously recorded outcomes.
 - Erasure replay chooses the newest receipt set across exact scopes and stored

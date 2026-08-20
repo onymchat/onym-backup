@@ -258,6 +258,16 @@ impl Store {
             self.connection
                 .execute("ALTER TABLE operation_outcomes ADD COLUMN receipt_ids TEXT", [])?;
         }
+        // Earlier pre-release builds used the abstract UI state
+        // `erased` for an operator acknowledgement. The profile now
+        // reserves that word for the client's later, deadline-based
+        // destruction judgement.
+        self.connection.execute(
+            "UPDATE operation_outcomes
+             SET status = 'erasure_acknowledged'
+             WHERE status = 'erased'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -666,7 +676,7 @@ impl Store {
         transaction.execute(
             "INSERT OR REPLACE INTO operation_outcomes
                 (operation_id, holder_handle, subject, status, receipt_ids, recorded_at)
-             VALUES (?1, ?2, ?3, 'erased', ?4, ?5)",
+             VALUES (?1, ?2, ?3, 'erasure_acknowledged', ?4, ?5)",
             rusqlite::params![
                 operation_id,
                 handle,
@@ -847,8 +857,8 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let outcomes = transaction.execute(
             "DELETE FROM operation_outcomes
-             WHERE (status <> 'erased' AND julianday(recorded_at) < julianday(?1))
-                OR (status =  'erased' AND julianday(recorded_at) < julianday(?2))",
+             WHERE (status <> 'erasure_acknowledged' AND julianday(recorded_at) < julianday(?1))
+                OR (status =  'erasure_acknowledged' AND julianday(recorded_at) < julianday(?2))",
             rusqlite::params![uploads_before, receipts_before],
         )?;
         // Coverage first, while the receipts it points at still exist
@@ -1015,7 +1025,9 @@ mod tests {
                     (operation_id, holder_handle, digest, status, recorded_at)
                 VALUES
                     ('op-old', 'holder', 'sha256:old', 'retained',
-                     '2026-08-20T10:00:00Z');
+                     '2026-08-20T10:00:00Z'),
+                    ('op-old-erase', 'holder', 'all', 'erased',
+                     '2026-08-20T10:30:00Z');
                 "#,
             )
             .unwrap();
@@ -1029,12 +1041,16 @@ mod tests {
         assert_eq!(outcome.1, "retained");
         assert_eq!(outcome.2, None);
 
+        let old_erasure = store.outcome("holder", "op-old-erase").unwrap().unwrap();
+        assert_eq!(old_erasure.0, "all");
+        assert_eq!(old_erasure.1, "erasure_acknowledged");
+
         store
             .record_outcome(
                 "op-erase",
                 "holder",
                 "all",
-                "erased",
+                "erasure_acknowledged",
                 Some(r#"["receipt"]"#.into()),
                 "2026-08-20T11:00:00Z",
             )
@@ -1064,7 +1080,7 @@ mod tests {
                 "op-erase",
                 "holder",
                 "sha256:old",
-                "erased",
+                "erasure_acknowledged",
                 Some(r#"["receipt"]"#.into()),
                 "2026-01-01T00:00:00Z",
             )

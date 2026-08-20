@@ -51,7 +51,11 @@ pub async fn query(
     // digest; an erasure's is its scope, which may be "all" — and a
     // field called `digest` reporting "all" is a scope wearing a
     // digest's name.
-    let subject_field = if status == "erased" { "scope" } else { "digest" };
+    let subject_field = if status == "erasure_acknowledged" {
+        "scope"
+    } else {
+        "digest"
+    };
     let mut outcome = json!({
         "componentId": state.config.component_id,
         "operationId": operation_id,
