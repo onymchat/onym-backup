@@ -96,9 +96,12 @@ async fn main() {
     };
     tracing::info!(%bind_addr, "listening");
 
-    // Bodies are capped here as well as per-route: an unbounded body is
-    // memory an unauthenticated caller chooses for us.
-    let app = api::router(state).layer(tower_http::limit::RequestBodyLimitLayer::new(
+    // `DefaultBodyLimit`, not `RequestBodyLimitLayer`. Both cap a body;
+    // only the former can be raised on one route. The §9 chunk upload
+    // needs its own, larger bound from the grant, and a tower layer
+    // wrapping the whole router has no opt-out — the ceiling would have
+    // been discovered when uploads landed and looked like a client bug.
+    let app = api::router(state).layer(axum::extract::DefaultBodyLimit::max(
         api::MAX_JSON_BODY_BYTES,
     ));
     if let Err(error) = axum::serve(listener, app).await {

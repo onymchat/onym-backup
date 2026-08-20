@@ -145,6 +145,34 @@ impl Config {
         })
     }
 
+    /// A configuration built directly, for tests.
+    ///
+    /// `from_env` reads process-global state, and Rust runs tests in
+    /// parallel threads — so two tests setting different values race,
+    /// and the first one to configure issuers can flip `charges` under
+    /// another test's feet. Constructing the values is both safer and
+    /// clearer about what a given test depends on.
+    #[cfg(test)]
+    pub fn for_tests(component_id: &str, entitlement_issuers: Vec<String>) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".into(),
+            store_path: ":memory:".into(),
+            blob_root: "/tmp/onym-backup-tests".into(),
+            component_id: component_id.into(),
+            public_url: "https://backup.example".into(),
+            signing_seed: [0x11; 32],
+            entitlement_issuers,
+            revocation_url: None,
+            revocation_poll_secs: 900,
+            maximum_sealed_snapshot_bytes: 2 * 1024 * 1024 * 1024,
+            maximum_retained_snapshots: 3,
+            chunk_bytes: 8 * 1024 * 1024,
+            upload_expiry_secs: 24 * 3600,
+            max_skew_secs: 300,
+            outcome_retention_secs: 6 * 3600,
+        }
+    }
+
     /// True when this operator charges. Free operators never return
     /// `402` and never look at an entitlement.
     pub fn requires_entitlement(&self) -> bool {

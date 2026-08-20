@@ -27,6 +27,10 @@ use crate::store::Store;
 /// §13 caps a JSON request body at 256 KiB. Chunk uploads are
 /// `application/octet-stream` and get their own, larger bound from the
 /// grant — this is the ceiling for everything that is not bytes.
+///
+/// Applied with `DefaultBodyLimit`, which a route can override.
+/// `RequestBodyLimitLayer` cannot be, so it would have made the upload
+/// route's larger bound unreachable.
 pub const MAX_JSON_BODY_BYTES: usize = 256 * 1024;
 
 pub struct AppState {
@@ -63,11 +67,11 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn manifest(State(state): State<Arc<AppState>>) -> Response {
-    signed_json(state.documents.manifest.clone())
+    json_document(state.documents.manifest.clone())
 }
 
 async fn profile(State(state): State<Arc<AppState>>) -> Response {
-    signed_json(state.documents.profile.clone())
+    json_document(state.documents.profile.clone())
 }
 
 /// Content-addressed terms.
@@ -83,19 +87,25 @@ async fn terms(
 ) -> Result<Response> {
     let requested = terms_file
         .strip_suffix(".json")
-        .ok_or(Error::NotFound(Resource::Snapshot))?;
+        .ok_or(Error::NotFound(Resource::Terms))?;
     let (current_id, bytes) = &state.documents.terms;
     let current_hex = current_id.strip_prefix("sha256:").unwrap_or(current_id);
     if requested != current_hex {
         // Historical terms are served from disk in a later slice; they
         // must outlive any single boot, because a retained snapshot
         // pins one.
-        return Err(Error::NotFound(Resource::Snapshot));
+        return Err(Error::NotFound(Resource::Terms));
     }
-    Ok(signed_json(bytes.clone()))
+    Ok(json_document(bytes.clone()))
 }
 
-fn signed_json(bytes: Vec<u8>) -> Response {
+/// Serves a published document verbatim.
+///
+/// Named for what it does rather than for the manifest and terms, which
+/// happen to be signed: the profile is not, and a helper called
+/// `signed_json` asserted something false about one of its three
+/// callers.
+fn json_document(bytes: Vec<u8>) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -112,11 +122,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn state() -> Arc<AppState> {
-        std::env::set_var("BACKUP_COMPONENT_ID", "onym:component:test");
-        std::env::set_var("BACKUP_PUBLIC_URL", "https://backup.example");
-        std::env::set_var("BACKUP_SIGNING_SEED", "22".repeat(32));
-        std::env::remove_var("BACKUP_ENTITLEMENT_ISSUERS");
-        let config = Config::from_env().unwrap();
+        let config = Config::for_tests("onym:component:test", vec![]);
         let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
         let documents = Documents::build(&config, &signing).unwrap();
         Arc::new(AppState {
@@ -193,11 +199,33 @@ mod tests {
     /// absent rather than absent-by-intention.
     #[test]
     fn no_code_reassigns_a_snapshots_holder() {
-        let sources = [
-            include_str!("store.rs"),
-            include_str!("api.rs"),
-            include_str!("documents.rs"),
+        // Every module, and the list is checked against `main.rs` below
+        // so it cannot narrow silently as files are added — a guarantee
+        // that quietly stops covering new code is worse than none,
+        // because it still reads as covered.
+        let sources: [(&str, &str); 6] = [
+            ("api", include_str!("api.rs")),
+            ("config", include_str!("config.rs")),
+            ("documents", include_str!("documents.rs")),
+            ("error", include_str!("error.rs")),
+            ("payload", include_str!("payload.rs")),
+            ("store", include_str!("store.rs")),
         ];
+
+        let declared: Vec<String> = include_str!("main.rs")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("mod "))
+            .filter_map(|line| line.strip_suffix(';'))
+            .map(str::to_string)
+            .collect();
+        for module in &declared {
+            assert!(
+                sources.iter().any(|(name, _)| name == module),
+                "module `{module}` is not covered by the holder-reassignment scan; add it"
+            );
+        }
+
+        let sources = sources.map(|(_, source)| source);
         // Assembled from parts so this file, which scans itself, does
         // not match on the needle. The first version did exactly that
         // and failed — which at least proved the scan works.

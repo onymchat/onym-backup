@@ -264,11 +264,7 @@ mod tests {
     use ed25519_dalek::Verifier;
 
     fn config() -> Config {
-        std::env::set_var("BACKUP_COMPONENT_ID", "onym:component:test");
-        std::env::set_var("BACKUP_PUBLIC_URL", "https://backup.example");
-        std::env::set_var("BACKUP_SIGNING_SEED", "11".repeat(32));
-        std::env::remove_var("BACKUP_ENTITLEMENT_ISSUERS");
-        Config::from_env().unwrap()
+        Config::for_tests("onym:component:test", vec![])
     }
 
     fn documents() -> (Documents, SigningKey) {

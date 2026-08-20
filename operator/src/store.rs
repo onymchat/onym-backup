@@ -261,6 +261,11 @@ mod tests {
 
     /// The absence is the design. A table here would make this a
     /// different seat, so it is asserted rather than described.
+    ///
+    /// A tripwire, not a proof: it catches a table named for what it is
+    /// and would miss one called `fetch_history`. What actually keeps
+    /// the property is that nothing writes such a table — this exists
+    /// so adding the obvious one is noisy.
     #[test]
     fn there_is_no_access_log_table() {
         let store = Store::in_memory().unwrap();
