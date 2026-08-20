@@ -36,13 +36,33 @@ entitlement enforcement is a declared capability.
 
 ## Status
 
-The §9 route table is complete apart from entitlements: preflight,
-chunked upload, commit, list, download, erase with signed receipts,
-export, and outcome reconciliation. Quota and grant expiry are
-enforced, every terms document is served forever, and a sweep deletes
-bytes no row accounts for. What remains is the paid path — verifying a
-broker's `SeatEntitlement`, polling revocation epochs, and the
-lapse/grace behaviour that hangs off them.
+The §9 route table is complete: preflight, chunked upload, commit,
+list, download, erase with signed receipts, export, outcome
+reconciliation, and entitlement registration. Quota and grant expiry
+are enforced, every terms document is served forever, and a sweep
+deletes bytes no row accounts for.
+
+The paid path is implemented — `SeatEntitlement` verification against
+issuers pinned at boot, a revocation-epoch poller that keeps serving on
+the last good epoch through a broker outage, and lapse and grace
+derived per snapshot from the terms it was accepted under.
+
+Two things are worth knowing before running this against a broker:
+
+- **A credential may arrive two ways.** §9.1 specifies
+  `POST /v1/entitlements`; both shipped clients instead attach
+  `X-Onym-Entitlement` to every authenticated request and deliberately
+  omit it on `/v1/exports`. Both paths run the same verifier.
+- **A non-null `quota` is refused.** This operator sells a
+  subscription, and keeping a purchased balance it never decrements
+  would be claiming to honour terms it has not implemented. A
+  consumable offer needs that balance built first.
+
+What remains is not code here: nothing issues a `SeatEntitlement` yet,
+so the §18.12 payment loop is exercised against a test broker rather
+than a real one, and the §18 fixtures — the shared, byte-identical ones
+§19 asks for — are still unwritten. Until they exist, conformance is a
+claim rather than a result.
 
 ```
 BACKUP_COMPONENT_ID=onym:component:you \
@@ -52,4 +72,13 @@ cargo run -p onym-backup-operator
 ```
 
 With no `BACKUP_ENTITLEMENT_ISSUERS` that is a complete free-mode
-operator's configuration.
+operator's configuration. A charging one adds three, and refuses to
+boot without them — an operator that names issuers but no revocation
+URL would honour refunds never, and one that names no offer would send
+a `402` telling the client to buy something without saying what:
+
+```
+BACKUP_ENTITLEMENT_ISSUERS=onym:key:<broker-hex> \
+BACKUP_REVOCATION_URL=https://broker.example/v1/revocations/current \
+BACKUP_OFFERS=backup-monthly-v1
+```

@@ -38,6 +38,17 @@ pub async fn query(
 
     let store = state.store.lock().await;
     let holder = authenticate(&headers, "GET", path, b"", &state.config, &store, now)?;
+    // Always available. Reconciling a lost response is not a service a
+    // holder can be behind on paying for — refusing it would strand
+    // them between two states rather than charge them for anything.
+    crate::lapse::require(
+        &state,
+        &store,
+        &holder,
+        &headers,
+        crate::lapse::Operation::Reconcile,
+        now,
+    )?;
 
     // Scoped to the asking holder. The id is client-chosen, so an
     // unscoped lookup would let one holder read another's outcome by

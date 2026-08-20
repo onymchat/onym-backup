@@ -52,6 +52,10 @@ pub struct AppState {
     /// Serialises mutations of committed snapshot directories with the
     /// SQLite transitions that make those bytes live or erased.
     pub blob_mutations: tokio::sync::Mutex<()>,
+    /// The broker's revocation epoch in force. Read by every
+    /// authenticated request on a charging operator, which is why it
+    /// sits behind its own lock rather than the store's.
+    pub revocation: crate::revocation::Revocation,
 }
 
 impl AppState {
@@ -84,6 +88,7 @@ impl AppState {
             store: tokio::sync::Mutex::new(store),
             blobs,
             blob_mutations: tokio::sync::Mutex::new(()),
+            revocation: crate::revocation::Revocation::new(),
         })
     }
 }
@@ -95,6 +100,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/manifest.json.sig", get(manifest_signature))
         .route("/profile.json", get(profile))
         .route("/terms/:terms_file", get(terms))
+        // §9.1. Both shipped clients present a credential on the
+        // `X-Onym-Entitlement` header instead of registering it here,
+        // and both paths run the same verifier — see `entitlements`.
+        .route("/v1/entitlements", post(crate::entitlements::register))
         .route("/v1/preflight", post(crate::uploads::preflight))
         .route(
             "/v1/uploads/:upload_id/chunks/:index",
@@ -133,6 +142,16 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "operator": state.documents.operator_key,
         "declaredTerms": state.documents.terms.0,
         "charges": state.config.requires_entitlement(),
+        // §4.1 requires revocation-epoch staleness here. The maximum
+        // revocation latency an operator can honestly claim is its poll
+        // interval plus the broker's epoch interval, and a stuck poller
+        // silently widens that — so the age is published rather than
+        // left for the operator to infer from logs. `null` on a free
+        // operator, which has no broker to be stale about.
+        "revocation": state.revocation.health(
+            &state.config,
+            time::OffsetDateTime::now_utc(),
+        ),
     }))
     .into_response()
 }
@@ -440,9 +459,12 @@ mod tests {
         // so it cannot narrow silently as files are added — a guarantee
         // that quietly stops covering new code is worse than none,
         // because it still reads as covered.
-        let sources: [(&str, &str); 13] = [
+        let sources: [(&str, &str); 16] = [
             ("api", include_str!("api.rs")),
+            ("entitlements", include_str!("entitlements.rs")),
             ("erasures", include_str!("erasures.rs")),
+            ("lapse", include_str!("lapse.rs")),
+            ("revocation", include_str!("revocation.rs")),
             ("export", include_str!("export.rs")),
             ("operations", include_str!("operations.rs")),
             ("uploads", include_str!("uploads.rs")),

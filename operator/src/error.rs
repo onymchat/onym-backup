@@ -60,6 +60,7 @@ pub enum Error {
         component_id: String,
         offers: Vec<String>,
         entitlement_issuers: Vec<String>,
+        manifest_url: String,
     },
 
     /// An entitlement was presented and refused.
@@ -193,12 +194,17 @@ impl Error {
                 component_id,
                 offers,
                 entitlement_issuers,
+                manifest_url,
             } => json!({
                 "paymentRequired": {
                     "version": 1,
                     "componentId": component_id,
                     "offers": offers,
                     "entitlementIssuers": entitlement_issuers,
+                    // The issuers are also in the refusal, but only the
+                    // manifest's copy is signed. A client that pins from
+                    // an unsigned 402 has pinned whatever answered.
+                    "manifestUrl": manifest_url,
                 }
             }),
             Error::InvalidEntitlement {

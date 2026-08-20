@@ -202,7 +202,22 @@ fn manifest_document(config: &Config, operator_key: &str, terms_id: &str) -> Val
         // Empty in free mode, and that is the declaration: an operator
         // naming no issuers never asks for an entitlement.
         "entitlementIssuers": config.entitlement_issuers,
-        "offers": [],
+        // `ServiceManifest.offers` is an array of **objects**
+        // (WHITEPAPER §16.1), which is what both clients parse — an
+        // array of bare ids decodes lossily to nothing, leaving a
+        // charging operator's manifest declaring no offer at all. The
+        // §10.1 refusal is the one that carries bare ids, and that
+        // asymmetry is in the documents rather than a mistake.
+        //
+        // `model` is `subscription` because that is what this operator
+        // sells: a non-null `quota` is refused, so a consumable offer
+        // is not one it could honour. Still no price, no currency and
+        // no storefront — those belong to the frontend's channel
+        // agreement, not to anything an operator publishes.
+        "offers": config.offers.iter().map(|offer| json!({
+            "offerId": offer,
+            "model": "subscription",
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -255,6 +270,62 @@ fn iso_duration(seconds: i64) -> String {
     }
 }
 
+/// Read a declared duration back into seconds.
+///
+/// The inverse of `iso_duration`, and deliberately the same reader the
+/// clients use — `BackupDuration.seconds` in onym-ios `BackupTerms.swift`
+/// and its Kotlin twin. Years and months are approximated at 365 and 30
+/// days, which is unfit for calendar arithmetic and exactly right for
+/// the one question asked of it: how long is this declared window. The
+/// alternative is refusing to compare `P1M` against `P30D` at all.
+///
+/// **This must not drift from the client's reader.** A grace window the
+/// operator computes as shorter than the client displays is the person
+/// being cut off while their screen still says they have time.
+pub fn duration_seconds(value: &str) -> Option<i64> {
+    // A declaration of nothing is a real, comparable window of length
+    // zero — the profile requires `accessLogs: "none"`, and reading it
+    // as unparseable would make "no log at all" look like a malformed
+    // document rather than the strongest possible answer.
+    if value == "none" {
+        return Some(0);
+    }
+    let rest = value.strip_prefix('P')?;
+    let mut total: i64 = 0;
+    let mut number = String::new();
+    let mut in_time = false;
+    let mut saw_unit = false;
+    for character in rest.chars() {
+        if character == 'T' {
+            in_time = true;
+            continue;
+        }
+        if character.is_ascii_digit() {
+            number.push(character);
+            continue;
+        }
+        let magnitude: i64 = number.parse().ok()?;
+        number.clear();
+        saw_unit = true;
+        let seconds = match (character, in_time) {
+            ('Y', false) => 365 * 86_400,
+            ('M', false) => 30 * 86_400,
+            ('W', false) => 7 * 86_400,
+            ('D', false) => 86_400,
+            ('H', true) => 3_600,
+            ('M', true) => 60,
+            ('S', true) => 1,
+            _ => return None,
+        };
+        total = total.checked_add(magnitude.checked_mul(seconds)?)?;
+    }
+    // A trailing number with no unit is malformed, not a silent zero.
+    if !number.is_empty() || !saw_unit {
+        return None;
+    }
+    Some(total)
+}
+
 fn default_terms(config: &Config, operator_key: &str) -> Value {
     json!({
         "termsVersion": 1,
@@ -293,7 +364,24 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             "holderIdentifiers": "while any snapshot, receipt, erased reference, or live grant is held",
             "operationOutcomes": iso_duration(config.outcome_retention_secs),
             "erasureReceipts": iso_duration(config.receipt_retention_secs),
-            "entitlementRecords": "to expiry plus one revocation-epoch interval",
+            // Longer than §15's table suggests, and deliberately: the
+            // record is what lapse is derived from. Its `expiresAt` is
+            // the moment the holder lapsed, and both the grace window
+            // above and the post-grace expiry are computed from it, so
+            // a record discarded at expiry plus a poll interval would
+            // end this document's own `notice` plus `grace` early and
+            // leave nothing to expire the snapshot from afterwards.
+            //
+            // §15's rule is that records are declared rather than
+            // wished away, and §18.24 checks the operator against its
+            // declaration rather than against the table, so the honest
+            // move is to say the window that is actually held. It is
+            // the longest published notice-and-grace because a snapshot
+            // keeps the terms it was accepted under, which may not be
+            // these.
+            "entitlementRecords":
+                "to expiry, plus the longest notice-and-grace this operator has published, \
+                 plus one revocation-epoch interval",
             // How long the grant *record* outlives `expiresAt` — not
             // how long a grant lives. The partial bytes are never kept
             // past `expiresAt`. This declares the sweep interval
@@ -333,6 +421,28 @@ mod tests {
     /// case-insensitive order. Today's documents cannot tell the two
     /// apart — every key is lowercase ASCII — so the fixture uses keys
     /// that can.
+    /// The shape both clients parse. `ServiceOffer.decodeLossy` skips
+    /// any element that is not an object carrying `offerId` and
+    /// `model`, so an array of bare ids leaves a charging operator
+    /// declaring no offer at all — and the failure is silent, because
+    /// lossy decoding is not an error.
+    #[test]
+    fn published_offers_are_objects_a_client_can_decode() {
+        let config = Config::for_tests("onym:component:test", vec!["onym:key:aa".into()]);
+        let manifest = manifest_document(&config, "onym:key:bb", "sha256:cc");
+        let offers = manifest["offers"].as_array().unwrap();
+        assert_eq!(offers.len(), config.offers.len());
+        assert_eq!(offers[0]["offerId"], json!(config.offers[0]));
+        assert!(
+            offers[0]["model"].as_str().is_some_and(|m| !m.is_empty()),
+            "an offer without a model decodes to nothing"
+        );
+        // §10.1 still holds: nothing about what it costs.
+        for key in ["price", "currency", "storefront"] {
+            assert!(offers[0].get(key).is_none(), "{key} appeared in an offer");
+        }
+    }
+
     #[test]
     fn canonical_keys_sort_by_utf8_byte_order() {
         let value = json!({ "a": 1, "Z": 2, "\u{10400}": 3, "b": 4 });

@@ -1,3 +1,10 @@
 target/
 *.env
 !*.env.example
+
+# QA discovery publishing: the signing seed and the served output.
+# A seed published beside the catalog it signs is a catalog anyone can
+# rewrite.
+deploy/discovery/provider.seed
+deploy/discovery/out/
+deploy/discovery/reviewed/

@@ -18,6 +18,14 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Breaking
 
+- **`payment_required` carries `manifestUrl`.** §10.1 requires it, and
+  without it a client pins issuers from an unsigned refusal — which is
+  pinning whatever answered. The issuers stay in the refusal so it is
+  legible on its own; only the manifest's copy is signed.
+- **A charging operator must declare `BACKUP_OFFERS`.** Refused at boot
+  alongside the existing `BACKUP_REVOCATION_URL` check. A `402` naming
+  no offer tells a client to buy something without saying what, and the
+  payment loop stops there.
 - **`upload_incomplete` reports gaps as ranges.** `missingChunks` is an array
   of inclusive `[first, last]` index ranges — ascending, non-overlapping,
   non-adjacent — and `missingChunkCount` is gone. It was previously an array of
@@ -45,8 +53,46 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Added
 
-- Erase with signed receipts, export, and outcome reconciliation: the §9 route
-  table apart from entitlements.
+- **The paid path.** `SeatEntitlement` verification per §10.4 — canonical
+  bytes, a signature from an issuer pinned at boot and published in the
+  manifest, `audience`, exact-string `subject`, the validity window, and
+  absence from the cached revocation epoch. Every failure answers
+  `invalid_entitlement` and names the issuers, never which check failed.
+- `POST /v1/entitlements` (§9.1), idempotent by `entitlementId` — and
+  `X-Onym-Entitlement`, which is what onym-ios and onym-android actually
+  send on every authenticated request, and deliberately omit on
+  `/v1/exports`. Both run the same verifier. The header is not in the
+  profile; refusing it would have broken both clients, and dropping the
+  route would have left §9.1 unimplemented.
+- A revocation-epoch poller. **A failed poll is not a refusal** (§10.4):
+  the last good epoch stays in force, is cached in SQLite so a restart
+  during a broker outage comes back with it, and its age is published in
+  `/health` as §4.1 requires. A re-published older epoch cannot
+  un-revoke anything.
+- Lapse and grace (§10.3), derived from entitlement expiry and never
+  from a charge — this operator is not the seller and has no charge to
+  fail. Each retained snapshot is governed by the `endOfPayment` clause
+  of **its own** pinned terms, notice then grace; what stays open is the
+  **union** of `duringGrace` across snapshots still in one. `preflight`
+  refuses holder-wide, because a lapsed holder is not owed new retention
+  by any snapshot's terms — but a grant already issued stays finishable,
+  chunks and commit included (§9.2). The allowlist is an explicit table
+  in `lapse`, not an emergent property of which routes happen to check
+  an entitlement, and the two ungated routes are entries in it rather
+  than absences from it.
+- Past grace, the sweep expires a snapshot and its bytes go with it,
+  reported as `retention_expired` rather than `erased`. The holder did
+  not erase it, and **no receipt is minted** — a §11 receipt answers a
+  holder's request, and signing one unasked would be evidence of a
+  decision they did not make. A terms document declaring a post-grace
+  cold state this operator does not implement keeps its bytes and says
+  so, rather than deleting on a clause it cannot honour.
+- Conformance tests §18.11 (forged issuer, mutated field, expired
+  window, wrong audience, wrong subject, revoked id), §18.12 (the
+  payment loop, same `operationId` and same bytes across the refusal),
+  and §18.13 (export succeeds for a holder with no entitlement, against
+  an operator that charges).
+- Erase with signed receipts, export, and outcome reconciliation.
 - `GET /v1/exports/receipts/{receiptId}` — receipts are §12 container members,
   and without this a holder whose erase response was lost could never obtain
   the receipt they earned.
@@ -64,6 +110,34 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Fixed
 
+- **A lapse mid-upload stranded the grant it arrived in the middle of.**
+  Chunks and commit were gated on payment, so a holder whose seat lapsed
+  with bytes already on the operator's disk held a grant they could
+  neither finish nor abandon — it consumed quota until it expired, and
+  every byte already transferred was wasted. §9.2 is explicit that
+  finishing an upload the operator agreed to take is the smaller
+  commitment: the entitlement was checked when the grant was minted, and
+  the grant's own `expiresAt` bounds it and is never extended. Only
+  `preflight` — the route that mints one — refuses.
+- **The entitlement record was swept ~43 days before the grace it
+  opened.** Records were deleted at expiry plus one poll interval, but
+  that row's `expires_at` is the moment lapse is derived from: within an
+  hour of expiry the holder read as never having paid rather than as in
+  grace, closing the download and erase their terms promised for another
+  six weeks, and `post_grace_due` then returned empty forever, so the
+  snapshot was never expired and the bytes were held indefinitely. The
+  record now survives until expiry plus the longest notice-and-grace
+  this operator has published plus one revocation-epoch interval — the
+  point at which every window it could open has closed and the sweep has
+  acted on it — and `metadataRetention.entitlementRecords` declares
+  exactly that, so §18.24 checks the operator against what it holds.
+- **`expiresAt` was exclusive.** A credential was refused at the exact
+  instant it expired, where §10.4 specifies `notBefore <= now <=
+  expiresAt`. One instant, but the same field starts the lapse clock, so
+  the operator was beginning notice-and-grace a tick before the
+  credential ran out. The onym-ios client is stricter by that instant in
+  the safe direction — it declines to use a credential this operator
+  would still accept.
 - Retention windows that cannot be represented are refused at boot instead of
   panicking the hourly sweep, and RFC 3339 values are compared as timestamps
   rather than strings.
@@ -105,6 +179,20 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   `operationId`.
 
 ### Notes
+
+**A non-null `quota` is refused as `invalid_entitlement`.** The
+whitepaper's consumable case expects a replay-protected balance keyed by
+`entitlementId`, and this operator does not keep one. Storing a
+purchased balance and never decrementing it would be claiming to honour
+terms it has not implemented; the columns are in the schema and unused
+until a broker actually issues consumables.
+
+**There is no `lapse_state` table**, and earlier schemas that created
+one now drop it. Lapse is derived — from the newest unrevoked
+entitlement's expiry, then per snapshot from its own pinned terms. A
+cached copy would be a per-holder payment record that nothing reads,
+that §15 would have to declare, and that can only ever disagree with the
+derivation.
 
 Two changes are deliberately *not* here because they are not observable: the
 store lock is no longer held across hashing, streaming or unlinking, and

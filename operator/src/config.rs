@@ -31,6 +31,13 @@ pub struct Config {
     /// Where the broker publishes revocation epochs.
     pub revocation_url: Option<String>,
     pub revocation_poll_secs: u64,
+    /// Offer ids a `402` names, so a client knows what to buy.
+    ///
+    /// Ids only. §10.1 is explicit that a refusal carries no price, no
+    /// currency, no storefront and no product name — pricing belongs to
+    /// the frontend's channel agreement, and an operator that puts a
+    /// price in a `402` is asserting terms it is not party to.
+    pub offers: Vec<String>,
 
     pub maximum_sealed_snapshot_bytes: i64,
     pub maximum_retained_snapshots: i64,
@@ -112,6 +119,21 @@ impl Config {
             })?;
         }
 
+        let offers: Vec<String> = env::var("BACKUP_OFFERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        // A charging operator whose refusal names no offer has told the
+        // client to buy something without saying what. The payment loop
+        // stops there, so it is a boot error rather than a 402 nobody
+        // can act on.
+        if !entitlement_issuers.is_empty() && offers.is_empty() {
+            return Err("BACKUP_OFFERS is required when BACKUP_ENTITLEMENT_ISSUERS is set".into());
+        }
+
         let revocation_url = env::var("BACKUP_REVOCATION_URL").ok().filter(|v| !v.is_empty());
         if !entitlement_issuers.is_empty() && revocation_url.is_none() {
             // Charging without a way to learn about refunds means a
@@ -140,6 +162,7 @@ impl Config {
             // negative maximum is a limit that refuses everything — none
             // of them is a configuration someone meant.
             revocation_poll_secs: parse_positive_u64("BACKUP_REVOCATION_POLL_SECS", 900)?,
+            offers,
             maximum_sealed_snapshot_bytes: parse_positive_i64(
                 "BACKUP_MAX_SNAPSHOT_BYTES",
                 2 * 1024 * 1024 * 1024,
@@ -185,6 +208,7 @@ impl Config {
             entitlement_issuers,
             revocation_url: None,
             revocation_poll_secs: 900,
+            offers: vec!["backup-monthly-v1".into()],
             maximum_sealed_snapshot_bytes: 2 * 1024 * 1024 * 1024,
             maximum_retained_snapshots: 3,
             chunk_bytes: 8 * 1024 * 1024,
@@ -200,6 +224,12 @@ impl Config {
     /// `402` and never look at an entitlement.
     pub fn requires_entitlement(&self) -> bool {
         !self.entitlement_issuers.is_empty()
+    }
+
+    /// Where §10.1's refusal points a client to check the issuers it
+    /// was told about, against a document that is signed.
+    pub fn manifest_url(&self) -> String {
+        format!("{}/manifest.json", self.public_url)
     }
 
     pub fn usage() -> &'static str {
@@ -218,6 +248,7 @@ Optional:
   BACKUP_ENTITLEMENT_ISSUERS    comma-separated onym:key:<hex>; empty = free mode
   BACKUP_REVOCATION_URL         https; required when issuers are set
   BACKUP_REVOCATION_POLL_SECS   default 900
+  BACKUP_OFFERS                 comma-separated offer ids named by a 402
   BACKUP_MAX_SNAPSHOT_BYTES     default 2 GiB
   BACKUP_MAX_SNAPSHOTS          default 3
   BACKUP_CHUNK_BYTES            default 8 MiB

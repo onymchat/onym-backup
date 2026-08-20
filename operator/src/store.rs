@@ -193,15 +193,15 @@ impl Store {
                 PRIMARY KEY (holder_handle, nonce)
             );
 
-            -- Derived from entitlement expiry, never from a charge
-            -- failure — this operator is not the seller and has no
-            -- charge to fail.
-            CREATE TABLE IF NOT EXISTS lapse_state (
-                holder_handle     TEXT PRIMARY KEY,
-                lapsed_at         TEXT NOT NULL,
-                grace_expires_at  TEXT NOT NULL,
-                post_grace_action TEXT NOT NULL
-            );
+            -- There is no `lapse_state` table, and that absence is
+            -- deliberate. Lapse is *derived* — from the newest
+            -- unrevoked entitlement's expiry, and then per snapshot
+            -- from the `endOfPayment` clause of its own pinned terms
+            -- (§10.3). A cached copy would be a per-holder payment
+            -- record that nothing reads and §15 would have to declare,
+            -- and it can only ever disagree with the derivation.
+            -- Earlier schemas created one; it was never written to.
+            DROP TABLE IF EXISTS lapse_state;
 
             CREATE TABLE IF NOT EXISTS revocation_cache (
                 epoch      INTEGER PRIMARY KEY,
@@ -502,6 +502,190 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Record a verified entitlement against a holder.
+    ///
+    /// Idempotent by `entitlementId` (§9.1), and the same call serves
+    /// the header path: a credential presented on a request is
+    /// registered exactly as one posted to §9.1's route would be.
+    /// Remembering it is not bookkeeping for its own sake — lapse
+    /// (§10.3) is derived from entitlement expiry, and an operator that
+    /// verified a credential and then forgot it has no way to know a
+    /// holder ever had one.
+    ///
+    /// `INSERT OR REPLACE` rather than `OR IGNORE`: a broker may
+    /// re-issue the same `entitlementId` with a later `expiresAt` on
+    /// renewal, and keeping the first copy would lapse a holder who
+    /// paid.
+    pub fn register_entitlement(
+        &self,
+        handle: &str,
+        entitlement: &crate::entitlements::VerifiedEntitlement,
+        now: &str,
+    ) -> Result<()> {
+        let stamp = |at: OffsetDateTime| -> Result<String> {
+            at.format(&Rfc3339)
+                .map_err(|e| Error::Internal(format!("format timestamp: {e}")))
+        };
+        self.connection.execute(
+            "INSERT OR REPLACE INTO holder_entitlements
+                (entitlement_id, holder_handle, offer_id, not_before, expires_at,
+                 quota_units, quota_unit, quota_consumed, raw, registered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 0, ?6, ?7)",
+            rusqlite::params![
+                entitlement.entitlement_id,
+                handle,
+                entitlement.offer_id,
+                stamp(entitlement.not_before)?,
+                stamp(entitlement.expires_at)?,
+                entitlement.raw,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The latest `expiresAt` among this holder's registered
+    /// entitlements, and whether that record is itself revoked.
+    ///
+    /// The *latest*, not the first found: a holder who renewed early
+    /// holds two credentials at once, and lapsing them on the older
+    /// one's expiry would cut off someone who has already paid for the
+    /// next period. Revoked records are preferred out of that choice —
+    /// a refunded entitlement that still sat in the table must not hold
+    /// a live one's protection off — but never dropped outright: if
+    /// every record is revoked, the latest revoked `expiresAt` is
+    /// returned rather than nothing, with the flag set so the caller
+    /// stops trusting it for new access without losing the timestamp
+    /// lapse, grace and the sweep all derive from.
+    ///
+    /// Returning `None` here when a revoked record was the holder's
+    /// only one used to erase that timestamp entirely: `evaluate` fell
+    /// straight to `Lapsed`, skipping the grace a still-unexpired
+    /// credential's terms had already promised, and `post_grace_due`
+    /// had nothing to derive from and returned empty forever, so the
+    /// snapshot's bytes were never expired at all.
+    pub fn entitlement_horizon(
+        &self,
+        handle: &str,
+        revoked: &HashSet<String>,
+    ) -> Result<Option<(String, bool)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT entitlement_id, expires_at FROM holder_entitlements
+             WHERE holder_handle = ?1",
+        )?;
+        let rows = statement.query_map([handle], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut live: Option<(OffsetDateTime, String)> = None;
+        let mut any: Option<(OffsetDateTime, String)> = None;
+        for row in rows {
+            let (id, expires_at) = row?;
+            let Ok(at) = OffsetDateTime::parse(&expires_at, &Rfc3339) else {
+                continue;
+            };
+            if any.as_ref().is_none_or(|(held, _)| at > *held) {
+                any = Some((at, expires_at.clone()));
+            }
+            if !revoked.contains(&id) && live.as_ref().is_none_or(|(held, _)| at > *held) {
+                live = Some((at, expires_at));
+            }
+        }
+        Ok(match live {
+            Some((_, text)) => Some((text, false)),
+            None => any.map(|(_, text)| (text, true)),
+        })
+    }
+
+    /// Whether this holder has ever registered an entitlement.
+    ///
+    /// Distinguishes "never paid" from "paid and lapsed", which are
+    /// different refusals: the first is a `402` that starts the payment
+    /// loop, the second is grace under terms already agreed.
+    pub fn has_entitlement_record(&self, handle: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM holder_entitlements WHERE holder_handle = ?1)",
+                [handle],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count == 1)
+            .map_err(Into::into)
+    }
+
+    /// Discard entitlement records past the declared window.
+    ///
+    /// The caller computes the floor — `lapse::record_floor` — and
+    /// `metadataRetention.entitlementRecords` declares exactly what it
+    /// computes: expiry, plus the longest notice-and-grace this
+    /// operator has ever published, plus one revocation-epoch interval.
+    ///
+    /// The epoch interval is in there because an entitlement revoked
+    /// just before it expired must stay recognisable for at least as
+    /// long as it takes the next epoch to say so. The notice-and-grace
+    /// term is in there because **this row is what lapse is derived
+    /// from**: `lapse::evaluate` and `lapse::post_grace_due` both read
+    /// `expires_at` as the moment the holder lapsed. Deleting it at
+    /// expiry plus the poll interval — an hour, in the default
+    /// configuration — would end a 44-day grace window on the first
+    /// sweep after expiry and, worse, leave `post_grace_due` with
+    /// nothing to derive from, so the snapshot would never be expired
+    /// and the operator would hold the bytes forever.
+    ///
+    /// Once the row goes, every window it could have opened is closed
+    /// and every action it could have triggered has been taken, which
+    /// is the condition a retention bound is supposed to express.
+    pub fn sweep_entitlements(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM holder_entitlements WHERE julianday(expires_at) < julianday(?1)",
+            [older_than],
+        )?)
+    }
+
+    /// Holders with at least one live snapshot.
+    ///
+    /// The sweep's starting point for post-grace expiry. Deriving lapse
+    /// from here rather than from `lapse_state` alone is deliberate: a
+    /// holder who stopped paying and never came back never triggers a
+    /// request-time evaluation, and an operator that only expired the
+    /// holders who kept knocking would hold the abandoned ones forever.
+    pub fn holders_with_snapshots(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT holder_handle FROM snapshots
+             WHERE erased_at IS NULL AND retained_until IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
+    }
+
+
+
+
+    /// Persist the epoch in force, so a restart during a broker outage
+    /// comes back with the revocations it had rather than with none.
+    pub fn cache_epoch(&self, epoch: i64, fetched_at: &str, document: &[u8]) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO revocation_cache (epoch, fetched_at, document)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![epoch, fetched_at, document],
+        )?;
+        // Only the newest is useful; older epochs are a list of
+        // revocations that have since been restated or expired.
+        self.connection.execute(
+            "DELETE FROM revocation_cache WHERE epoch < ?1",
+            [epoch],
+        )?;
+        Ok(())
+    }
+
+    /// The newest cached epoch, with when it was fetched.
+    pub fn latest_epoch(&self) -> Result<Option<(Vec<u8>, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT document, fetched_at FROM revocation_cache ORDER BY epoch DESC LIMIT 1",
+        )?;
+        let mut rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// Record a terms document, if it is not already known.
     ///
     /// Called at boot with the current terms. Idempotent: the same
@@ -514,6 +698,18 @@ impl Store {
             rusqlite::params![terms_id, raw, signature, now],
         )?;
         Ok(())
+    }
+
+    /// Every terms document this operator has ever published.
+    ///
+    /// Every one of them, not just the current pair: a snapshot pins
+    /// the terms it was accepted under, so an older document with a
+    /// longer `endOfPayment` still governs something on disk and still
+    /// bounds how long the records it is read against must be kept.
+    pub fn published_terms_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare("SELECT terms_id FROM terms_documents")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
     }
 
     /// A published terms document by id, with its detached signature.
