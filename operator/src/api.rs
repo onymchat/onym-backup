@@ -107,6 +107,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // only form that survives future edits, and a scan below holds
         // the module to it.
         .route("/v1/exports", get(crate::export::manifest))
+        // Before `/:digest`, and more specific than it — a receipt id
+        // is not a digest and must not be looked up as one.
+        .route("/v1/exports/receipts/:receipt_id", get(crate::export::receipt))
         .route("/v1/exports/:digest", get(crate::export::snapshot))
         .route("/v1/operations/:operation_id", get(crate::operations::query))
         .with_state(state)
@@ -181,7 +184,11 @@ async fn terms(
         .terms_document(&format!("sha256:{requested}"))?;
     let (raw, signature) = stored.ok_or(Error::NotFound(Resource::Terms))?;
     Ok(if detached {
-        signature_document(String::from_utf8_lossy(&signature).into_owned())
+        signature_document(String::from_utf8(signature).map_err(|_| {
+            // Lossy conversion would serve a corrupted signature that
+            // fails verification for a reason nobody could diagnose.
+            Error::Internal("stored terms signature is not valid UTF-8".into())
+        })?)
     } else {
         json_document(raw)
     })

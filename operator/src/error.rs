@@ -18,6 +18,7 @@ pub enum Resource {
     Upload,
     Operation,
     Terms,
+    Receipt,
 }
 
 impl std::fmt::Display for Resource {
@@ -27,6 +28,7 @@ impl std::fmt::Display for Resource {
             Resource::Upload => "upload",
             Resource::Operation => "operation",
             Resource::Terms => "terms",
+            Resource::Receipt => "receipt",
         })
     }
 }
@@ -139,6 +141,7 @@ impl Error {
             Error::NotFound(Resource::Upload) => "upload_not_found",
             Error::NotFound(Resource::Operation) => "operation_not_found",
             Error::NotFound(Resource::Terms) => "terms_not_found",
+            Error::NotFound(Resource::Receipt) => "receipt_not_found",
             Error::RetentionExpired => "retention_expired",
             Error::Internal(_) => "internal_error",
         }

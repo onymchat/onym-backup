@@ -231,8 +231,10 @@ fn detached(bytes: &[u8], signing: &SigningKey) -> String {
 /// boot, and it is signed by the same key that signs the manifest and
 /// the terms: a holder who can check one can check all three without
 /// learning a second key.
-pub fn sign_receipt(receipt: Value, signing: &SigningKey) -> Result<Vec<u8>> {
-    sign(receipt, signing, &["signature"])
+pub fn sign_receipt(receipt: Value, signing: &SigningKey) -> Result<(Value, Vec<u8>)> {
+    let bytes = sign(receipt, signing, &["signature"])?;
+    let document = serde_json::from_slice(&bytes).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok((document, bytes))
 }
 
 /// The starting terms.

@@ -22,6 +22,23 @@
 //! another conforming operator is an upload of the same bytes under the
 //! same reference — no re-sealing, and no cooperation from the operator
 //! being left (§18.3).
+//!
+//! **The operator serves the members; the client assembles the
+//! container.** `manifest.json` names in-container paths, and every one
+//! of them has to be fetchable while the operator lives or the manifest
+//! describes a container nobody can build:
+//!
+//! | Container path | Served at |
+//! |---|---|
+//! | `snapshots/<hex>.seal` | `GET /v1/exports/<hex>` |
+//! | `receipts/<id>.json` | `GET /v1/exports/receipts/<id>` |
+//! | `terms/<hex>.json` | the snapshot entry's `termsUrl` |
+//! | `terms/<hex>.json.sig` | `termsUrl` + `.sig` |
+//!
+//! That the terms come from `/terms/` rather than from under
+//! `/v1/exports/` is not a contradiction of the paragraph above: the
+//! container is assembled while the operator is alive, and it is the
+//! container — not the route — that has to outlive it.
 
 use std::sync::Arc;
 
@@ -111,6 +128,37 @@ pub async fn snapshot(
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
         axum::body::Body::from_stream(crate::uploads::snapshot_stream(paths)),
+    )
+        .into_response())
+}
+
+/// `GET /v1/exports/receipts/{receiptId}` — one signed receipt.
+///
+/// Receipts are container members (§12), so they have to be fetchable
+/// or the manifest lists a file the holder cannot obtain. It also
+/// closes a worse hole: a holder whose erase response was lost had no
+/// way to ever see the receipt they earned, and a receipt is the only
+/// evidence they hold that the erasure was ever acknowledged.
+///
+/// On the export branch, so it is as unconditional as the rest of it.
+pub async fn receipt(
+    State(state): State<Arc<AppState>>,
+    Path(receipt_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let now = OffsetDateTime::now_utc();
+    let path = format!("/v1/exports/receipts/{receipt_id}");
+
+    let store = state.store.lock().await;
+    let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
+    let raw = store
+        .receipt(&holder.handle, &receipt_id)?
+        .ok_or(Error::NotFound(Resource::Receipt))?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        raw,
     )
         .into_response())
 }

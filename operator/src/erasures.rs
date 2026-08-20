@@ -30,7 +30,14 @@ use crate::auth::authenticate;
 use crate::error::{Error, Resource, Result};
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EraseRequest {
+    /// Client-chosen, like every other operation's. §14.9
+    /// reconciliation is keyed on an id the *client* knows: an
+    /// operator-invented one cannot be asked about, so a lost erase
+    /// response would leave the holder with no way to find out whether
+    /// their erasure happened.
+    pub operation_id: String,
     pub scope: String,
 }
 
@@ -53,7 +60,7 @@ pub async fn erase(
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
 
-    let (holder, targets) = {
+    let (holder, request, targets) = {
         let store = state.store.lock().await;
         let holder = authenticate(
             &headers,
@@ -66,19 +73,31 @@ pub async fn erase(
         )?;
         let request: EraseRequest = serde_json::from_slice(&body)
             .map_err(|e| Error::BadRequest(format!("erasure body: {e}")))?;
+        if request.operation_id.trim().is_empty() {
+            return Err(Error::BadRequest("operationId is required".into()));
+        }
         if request.scope != "all" {
             crate::uploads::digest_hex(&request.scope)?;
         }
 
         let targets = store.snapshots_in_scope(&holder.handle, &request.scope)?;
         if targets.is_empty() {
-            // Nothing to erase and nothing to commit to. A receipt for
-            // an empty scope would be a signed statement about nothing.
+            // Nothing live in scope. If this scope was erased before,
+            // the holder is retrying and is owed the receipt they
+            // already earned — a 404 here would be the same silence
+            // `list` avoids by reporting `erased`.
+            let existing = store.receipts_for_scope(&holder.handle, &request.scope)?;
+            if !existing.is_empty() {
+                return Ok(axum::Json(decode_receipts(existing)?).into_response());
+            }
+            // Never held, so there is nothing to commit to. A receipt
+            // for an empty scope would be a signed statement about
+            // nothing.
             return Err(Error::NotFound(Resource::Snapshot));
         }
-        (holder, (request.scope, targets))
+        (holder, request, targets)
     };
-    let (scope, targets) = targets;
+    let scope = request.scope;
 
     // Bytes first, then the rows. A crash between them leaves a record
     // whose bytes are gone, which the sweep resolves and which `list`
@@ -112,12 +131,11 @@ pub async fn erase(
             let terms: Value = serde_json::from_slice(&raw)
                 .map_err(|e| Error::Internal(format!("stored terms: {e}")))?;
             let receipt = compose(&state, &terms, &terms_id, &scope, &stamp)?;
-            let signed = crate::documents::sign_receipt(receipt, &state.signing)?;
-            let receipt_id = serde_json::from_slice::<Value>(&signed)
-                .map_err(|e| Error::Internal(e.to_string()))?["receiptId"]
+            let receipt_id = receipt["receiptId"]
                 .as_str()
-                .unwrap_or_default()
+                .ok_or_else(|| Error::Internal("receipt has no id".into()))?
                 .to_string();
+            let (document, signed) = crate::documents::sign_receipt(receipt, &state.signing)?;
             store.record_receipt(
                 &receipt_id,
                 &holder.handle,
@@ -126,14 +144,11 @@ pub async fn erase(
                 &signed,
                 &stamp,
             )?;
-            receipts.push(
-                serde_json::from_slice::<Value>(&signed)
-                    .map_err(|e| Error::Internal(e.to_string()))?,
-            );
+            receipts.push(document);
         }
 
         store.record_outcome(
-            &format!("erase:{scope}"),
+            &request.operation_id,
             &holder.handle,
             &scope,
             "erased",
@@ -142,6 +157,15 @@ pub async fn erase(
     }
 
     Ok(axum::Json(receipts).into_response())
+}
+
+fn decode_receipts(raw: Vec<Vec<u8>>) -> Result<Vec<Value>> {
+    raw.iter()
+        .map(|bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|e| Error::Internal(format!("stored receipt: {e}")))
+        })
+        .collect()
 }
 
 /// One receipt, against one pinned terms document.
@@ -167,7 +191,14 @@ fn compose(
         return Err(Error::Internal("pinned terms declare no erasure scope".into()));
     }
 
-    let deadline = erasure["completionDeadline"].as_str().unwrap_or("P7D");
+    // Not defaulted. The module's rule is that a receipt cites the
+    // pinned terms and composes nothing at request time, and a default
+    // deadline is exactly a composed one — a commitment the holder
+    // never accepted, signed by this operator, indistinguishable
+    // afterwards from one they did.
+    let deadline = erasure["completionDeadline"].as_str().ok_or_else(|| {
+        Error::Internal("pinned terms declare no erasure completion deadline".into())
+    })?;
     let acknowledged = OffsetDateTime::parse(acknowledged_at, &Rfc3339)
         .map_err(|e| Error::Internal(format!("unparseable stamp: {e}")))?;
     let committed_by = (acknowledged + iso8601_days(deadline)?)
@@ -215,7 +246,18 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     async fn erase(harness: &Harness, scope: &str) -> (StatusCode, Value) {
-        let body = serde_json::to_vec(&json!({"version": 1, "scope": scope})).unwrap();
+        erase_as(harness, scope, &uuid::Uuid::new_v4().to_string()).await
+    }
+
+    async fn erase_as(
+        harness: &Harness,
+        scope: &str,
+        operation_id: &str,
+    ) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(
+            &json!({"version": 1, "operationId": operation_id, "scope": scope}),
+        )
+        .unwrap();
         let (status, bytes) = harness.send("POST", "/v1/erasures", body).await;
         (
             status,
@@ -369,4 +411,198 @@ mod tests {
         let (status, _) = erase(&harness, "all").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// Erasure without a usable operation id cannot be reconciled, so
+    /// it is refused rather than accepted and made unaskable.
+    ///
+    /// Both shapes, because they are refused by different code and only
+    /// one of them is mine: a missing field is serde's, and an empty
+    /// string sails past serde into a receipt nobody can ever ask
+    /// about. The first version of this test asserted only the missing
+    /// field and passed with the empty-string guard deleted.
+    #[tokio::test]
+    async fn an_erasure_must_carry_a_usable_operation_id() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+
+        let missing = serde_json::to_vec(&json!({"version": 1, "scope": "all"})).unwrap();
+        let (status, _) = harness.send("POST", "/v1/erasures", missing).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "no operationId at all");
+
+        let (status, _) = erase_as(&harness, "all", "   ").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a blank operationId");
+
+        // And the snapshot is still there — a refused erasure erases
+        // nothing.
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        assert_eq!(listed.as_array().unwrap()[0]["status"], "retained");
+    }
+
+    /// A lost erase response is reconciled by asking, like every other
+    /// operation — which is only possible because the id is the
+    /// client's.
+    #[tokio::test]
+    async fn a_lost_erase_response_can_be_reconciled() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        let (status, _) = erase_as(&harness, &digest, "op-erase-1").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = harness
+            .send("GET", "/v1/operations/op-erase-1", vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the erasure could not be reconciled");
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["outcome"]["status"], "erased");
+    }
+
+    /// Retrying an erase returns the receipt already earned. A 404
+    /// would be the same silence `list` avoids by reporting `erased`.
+    #[tokio::test]
+    async fn erasing_twice_returns_the_same_receipt() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        let (_, first) = erase(&harness, &digest).await;
+        let (status, again) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::OK, "a retried erase was refused");
+        assert_eq!(
+            again[0]["receiptId"], first[0]["receiptId"],
+            "the retry minted a second receipt"
+        );
+        assert_eq!(again[0]["signature"], first[0]["signature"]);
+    }
+
+    /// The receipt outlives the response that carried it. A holder
+    /// whose erase response was lost still has the only evidence they
+    /// hold that the erasure was acknowledged.
+    #[tokio::test]
+    async fn a_receipt_can_be_fetched_again_by_id() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        let (_, receipts) = erase(&harness, &digest).await;
+        let id = receipts[0]["receiptId"].as_str().unwrap().to_string();
+
+        let (status, body) = harness
+            .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "an issued receipt is unfetchable");
+        let fetched: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched["signature"], receipts[0]["signature"]);
+
+        // And it is holder-scoped like everything else.
+        let mut stranger = Harness::new(vec![]);
+        stranger.state = harness.state.clone();
+        stranger.signing = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let (status, _) = stranger
+            .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Every path the export manifest names must be fetchable, or the
+    /// manifest describes a container nobody can assemble.
+    #[tokio::test]
+    async fn every_container_member_the_manifest_names_is_fetchable() {
+        let harness = Harness::new(vec![]);
+        let first: Vec<u8> = (0..20u8).collect();
+        let second: Vec<u8> = (50..70u8).collect();
+        harness.store_snapshot(&first).await;
+        harness.store_snapshot(&second).await;
+        erase(&harness, &format!("sha256:{}", hex::encode(Sha256::digest(&first)))).await;
+
+        let (_, body) = harness.send("GET", "/v1/exports", vec![]).await;
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+
+        for entry in manifest["snapshots"].as_array().unwrap() {
+            let file = entry["file"].as_str().unwrap();
+            let hex = file.trim_start_matches("snapshots/").trim_end_matches(".seal");
+            let (status, _) = harness.send("GET", &format!("/v1/exports/{hex}"), vec![]).await;
+            assert_eq!(status, StatusCode::OK, "{file} is unfetchable");
+        }
+        for entry in manifest["receipts"].as_array().unwrap() {
+            let file = entry.as_str().unwrap();
+            let id = file.trim_start_matches("receipts/").trim_end_matches(".json");
+            let (status, _) = harness
+                .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+                .await;
+            assert_eq!(status, StatusCode::OK, "{file} is unfetchable");
+        }
+        // Terms come from `/terms/`, which is where the snapshot
+        // entry's `termsUrl` points. The container outlives the
+        // operator; the route only has to outlive the assembly.
+        for entry in manifest["terms"].as_array().unwrap() {
+            let hex = entry["file"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("terms/")
+                .trim_end_matches(".json");
+            for path in [format!("/terms/{hex}.json"), format!("/terms/{hex}.json.sig")] {
+                let response = crate::api::router(harness.state.clone())
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(&path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path} is unfetchable");
+            }
+        }
+
+        assert!(
+            !manifest["receipts"].as_array().unwrap().is_empty(),
+            "the fixture proves nothing without a receipt in it"
+        );
+        assert!(!manifest["terms"].as_array().unwrap().is_empty());
+    }
+
+    /// A receipt must not invent a deadline the pinned terms never
+    /// made. Terms without one are a broken document, not a licence to
+    /// choose a number and sign it.
+    #[tokio::test]
+    async fn terms_without_a_completion_deadline_produce_no_receipt() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        // Replace the stored terms with a document that declares scope
+        // and exclusions but no deadline.
+        {
+            let store = harness.state.store.lock().await;
+            let (raw, _) = store.terms_document(&harness.terms_id()).unwrap().unwrap();
+            let mut terms: Value = serde_json::from_slice(&raw).unwrap();
+            terms["erasure"]
+                .as_object_mut()
+                .unwrap()
+                .remove("completionDeadline");
+            store
+                .connection_for_tests()
+                .execute(
+                    "UPDATE terms_documents SET raw = ?2 WHERE terms_id = ?1",
+                    rusqlite::params![harness.terms_id(), serde_json::to_vec(&terms).unwrap()],
+                )
+                .unwrap();
+        }
+
+        let (status, _) = erase(&harness, &digest).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a deadline was invented for terms that declare none"
+        );
+    }
+
+    use tower::ServiceExt;
 }

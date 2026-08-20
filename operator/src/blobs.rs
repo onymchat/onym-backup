@@ -196,13 +196,19 @@ impl Blobs {
         read_dir_names(&self.root.join("incoming"))
     }
 
+    /// Remove a snapshot's bytes. Absent is success.
+    ///
+    /// Two erases of the same scope can arrive together — the store
+    /// lock is not held across blob work, deliberately — and an
+    /// `exists()` guard would still lose the race between the check and
+    /// the removal. "Already gone" is the outcome the caller wanted, so
+    /// it is not an error; anything else is.
     pub fn erase(&self, handle: &str, digest_hex: &str) -> Result<()> {
-        let dir = self.snapshot_dir(handle, digest_hex);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|e| Error::Internal(format!("erase snapshot: {e}")))?;
+        match std::fs::remove_dir_all(self.snapshot_dir(handle, digest_hex)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Internal(format!("erase snapshot: {error}"))),
         }
-        Ok(())
     }
 
     pub fn root(&self) -> &Path {

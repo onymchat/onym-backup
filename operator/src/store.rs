@@ -460,6 +460,31 @@ impl Store {
         Ok(())
     }
 
+    /// Receipts already issued for exactly this scope.
+    ///
+    /// What makes a retried erase idempotent: the snapshots are gone,
+    /// so there is nothing to erase, but the holder asking again is
+    /// owed the receipt rather than a 404 — which would be the same
+    /// "silence indistinguishable from never having stored it" that
+    /// `list` avoids by reporting `erased`.
+    pub fn receipts_for_scope(&self, handle: &str, scope: &str) -> Result<Vec<Vec<u8>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT raw FROM erasure_receipts
+             WHERE holder_handle = ?1 AND scope = ?2 ORDER BY issued_at",
+        )?;
+        let rows = statement.query_map(rusqlite::params![handle, scope], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<Vec<u8>>, _>>()?)
+    }
+
+    /// One receipt by id, scoped to its holder.
+    pub fn receipt(&self, handle: &str, receipt_id: &str) -> Result<Option<Vec<u8>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT raw FROM erasure_receipts WHERE holder_handle = ?1 AND receipt_id = ?2",
+        )?;
+        let mut rows = statement.query_map(rusqlite::params![handle, receipt_id], |row| row.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// This holder's receipts, for §12's container.
     pub fn receipts(&self, handle: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut statement = self.connection.prepare(
