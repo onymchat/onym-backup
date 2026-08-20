@@ -6,21 +6,27 @@ target/
 .git/
 .github/
 
-# Secrets. `COPY . .` uploads the context to whichever local or remote
-# BuildKit builder runs the build, and it is cached there — so a file
-# excluded from git is NOT thereby excluded from disclosure. Docker does
-# not read .gitignore, which means every secret-bearing pattern in it
-# has to be repeated here or it silently stops being secret at the
-# moment this repo becomes a build context.
+# Secrets, and the reason this list is not simply .gitignore:
 #
-# Mirrors .gitignore's `*.env` (its `!*.env.example` exception is
-# deliberately not mirrored: an example file is harmless in the context
-# and reproducing the negation is a way to get the pattern wrong).
+# `COPY . .` uploads the context to whichever local or remote BuildKit
+# builder runs the build, and caches it there. Docker does not read
+# .gitignore, so a file excluded from git is NOT thereby excluded from
+# disclosure — and .gitignore's `*.env` made that easy to miss, because
+# the pattern reads as handled.
+#
+# These two lines cover what .gitignore covers today. They are not a
+# mirror of it and must not be maintained as one: `!*.env.example` is
+# deliberately absent, because an example file is harmless in a build
+# context and reproducing a negation is a way to get the pattern subtly
+# wrong for no benefit.
 .env
 *.env
-*.seed
-deploy/discovery/provider.seed
 
-# Publishing artifacts and fetched manifests: output, not input.
-deploy/discovery/out/
-deploy/discovery/reviewed/
+# Forward-looking, and matches nothing in this repo today. Kept anyway
+# because this repo deals in signing seeds — the operator's own, and the
+# discovery provider's on the branch that adds publishing tooling — and
+# a seed that reaches a cached build context has been disclosed before
+# anyone notices the file is new. A deny-pattern that costs nothing is
+# the right shape for that; a pattern added after the first mistake is
+# not.
+*.seed

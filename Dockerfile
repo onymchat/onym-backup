@@ -26,7 +26,10 @@ COPY --from=builder /build/operator/target/release/onym-backup-operator /usr/loc
 # Unprivileged. This process holds other people's sealed archives and
 # has no reason to be able to write anywhere but its own two
 # directories; nothing it serves needs a privileged operation.
-RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/onym-backup operator \
+# No home directory: the process writes to /data and /blobs and nowhere
+# else, so creating one would be inventing a third writable path for
+# nothing to use.
+RUN useradd --system --uid 10001 --no-create-home --home-dir /nonexistent operator \
     && mkdir -p /data /blobs \
     && chown operator:operator /data /blobs
 USER operator
