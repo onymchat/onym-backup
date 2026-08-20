@@ -216,13 +216,12 @@ async fn main() {
         let outcome_window = state.config.outcome_retention_secs;
         let receipt_window = state.config.receipt_retention_secs;
         let erased_window = state.config.erased_reference_retention_secs;
-        // The entitlement floor is not a constant, so it is computed
-        // per sweep by `lapse::record_floor` from the terms this
-        // operator has published: expiry, plus the longest declared
-        // notice-and-grace, plus this interval. All three terms are in
-        // the `metadataRetention.entitlementRecords` declaration, and
-        // the reason for the middle one is that the record is what
-        // lapse is derived from — see `lapse::record_floor`.
+        // §15's bound on an entitlement record, and the whole of it:
+        // `expiresAt` plus one revocation-epoch interval. The grace the
+        // record opened outlives it by weeks, which is why the sweep
+        // derives `store::LapseState` before dropping it rather than
+        // keeping the credential for the length of the window — see
+        // `lapse::record_floor`.
         let poll_interval = state.config.revocation_poll_secs as i64;
         tokio::spawn(async move {
             loop {
@@ -232,22 +231,13 @@ async fn main() {
                         at.format(&time::format_description::well_known::Rfc3339)
                     };
                     let at = time::OffsetDateTime::now_utc();
-                    // Reads the published terms, so it needs the lock —
-                    // taken and released before `reconcile` takes it
-                    // again, the same short-burst discipline the sweep
-                    // itself follows.
-                    let entitlement_floor = match lapse::record_floor(
-                        &state.store.blocking_lock(),
-                        poll_interval,
-                        at,
-                    ) {
+                    let entitlement_floor = match lapse::record_floor(poll_interval, at) {
                         Ok(floor) => floor,
                         Err(error) => {
                             // Skip the sweep rather than fall back to a
-                            // shorter floor: a guessed floor deletes the
-                            // records lapse is derived from, and one
-                            // missed hour of tidying is recoverable
-                            // where that is not.
+                            // shorter floor. One missed hour of tidying
+                            // is recoverable; a floor guessed short is
+                            // records deleted early.
                             tracing::warn!(%error, "could not compute the entitlement record floor");
                             return None;
                         }
@@ -297,6 +287,7 @@ async fn main() {
                     Ok(Some(swept)) => {
                         if swept.post_grace_snapshots
                             + swept.aged_entitlements
+                            + swept.forgotten_lapse_state
                             + swept.expired_grants
                             + swept.orphan_incoming
                             + swept.orphan_snapshots
@@ -310,6 +301,7 @@ async fn main() {
                             tracing::info!(
                                 post_grace_snapshots = swept.post_grace_snapshots,
                                 aged_entitlements = swept.aged_entitlements,
+                                forgotten_lapse_state = swept.forgotten_lapse_state,
                                 expired_grants = swept.expired_grants,
                                 orphan_incoming = swept.orphan_incoming,
                                 orphan_snapshots = swept.orphan_snapshots,

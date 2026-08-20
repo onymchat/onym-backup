@@ -205,32 +205,44 @@ pub fn evaluate(
     }
 
     let revoked = state.revocation.revoked();
-    let Some((horizon, horizon_revoked)) = store.entitlement_horizon(&holder.handle, &revoked)?
-    else {
-        // No record at all. Either they never paid, or their records
-        // aged out of `entitlementRecords` — which is well past every
-        // grace window either way.
-        return Ok(if store.has_entitlement_record(&holder.handle)? {
-            Access::Lapsed
-        } else {
-            Access::Unpaid
-        });
+    let Some(horizon) = store.entitlement_horizon(&holder.handle, &revoked)? else {
+        // No record. Either they never paid, or the records aged out at
+        // §15's bound — in which case the derived lifecycle state is
+        // what still knows when the grace they were promised runs out.
+        let Some(state) = store.lapse_state(&holder.handle)? else {
+            return Ok(if store.has_entitlement_record(&holder.handle)? {
+                Access::Lapsed
+            } else {
+                Access::Unpaid
+            });
+        };
+        let lapsed_at = OffsetDateTime::parse(&state.lapsed_at, &Rfc3339)
+            .map_err(|e| Error::Internal(format!("derived lapse timestamp: {e}")))?;
+        return grace_from(store, holder, lapsed_at, now);
     };
 
-    let expires_at = OffsetDateTime::parse(&horizon, &Rfc3339)
-        .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
-    if !horizon_revoked && now < expires_at {
-        // Registered, unexpired, just not attached to this request.
-        return Ok(Access::Entitled);
+    // **Access** is the unrevoked answer, and only that. A revoked
+    // record contributes nothing here however far its own `expiresAt`
+    // still is: revocation blocks new paid work from the moment the
+    // epoch says so.
+    if let Some(access) = &horizon.access {
+        let expires_at = OffsetDateTime::parse(access, &Rfc3339)
+            .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
+        if now < expires_at {
+            // Registered, unexpired, just not attached to this request.
+            return Ok(Access::Entitled);
+        }
     }
 
-    // Revoked and not yet at its own `expiresAt`: still blocked from new
-    // paid work — the shortcut above is what grants `Entitled`, and it
-    // was skipped — but the terms a snapshot was accepted under still
-    // govern it, so grace is derived from the same `expiresAt` the
-    // credential itself declared rather than from the moment revocation
-    // was noticed.
-    grace_from(store, holder, expires_at, now)
+    // **Lifecycle** is the answer across every record, revoked
+    // included. The terms a snapshot was accepted under still govern
+    // it, so grace is derived from the latest `expiresAt` a credential
+    // declared rather than from the moment revocation was noticed — or
+    // from an older unrevoked record that happened to be the only one
+    // access could see.
+    let lapsed_at = OffsetDateTime::parse(&horizon.lifecycle, &Rfc3339)
+        .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
+    grace_from(store, holder, lapsed_at, now)
 }
 
 /// The union of what each snapshot's own terms still promise.
@@ -350,15 +362,12 @@ pub fn post_grace_due(
     revoked: &HashSet<String>,
     now: OffsetDateTime,
 ) -> Result<Vec<(String, String)>> {
-    let Some((horizon, _)) = store.entitlement_horizon(handle, revoked)? else {
-        // Nothing to lapse from. A holder with no entitlement record on
-        // a charging operator is one whose records aged out — and
-        // acting on that would make `entitlementRecords` expiry into a
+    let Some(lapsed_at) = lifecycle_horizon(store, handle, revoked)? else {
+        // Nothing to lapse from, and nothing derived either. Acting on
+        // that would make the expiry of a *retention bound* into a
         // deletion trigger, which is not what a retention bound is.
         return Ok(Vec::new());
     };
-    let lapsed_at = OffsetDateTime::parse(&horizon, &Rfc3339)
-        .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
     if now < lapsed_at {
         return Ok(Vec::new());
     }
@@ -378,58 +387,116 @@ pub fn post_grace_due(
     Ok(due)
 }
 
-/// How long an entitlement record must outlive its own `expiresAt`,
-/// and the cutoff `sweep_entitlements` deletes below.
+/// The moment a holder lapsed, from whichever record still knows it.
 ///
-/// This is the whole of finding: **the record is what lapse is derived
-/// from.** `evaluate` reads `expires_at` to decide whether a holder is
-/// in grace, and `post_grace_due` reads the same field to decide when
-/// the snapshot's own window has closed. A row swept at expiry plus the
-/// poll interval takes both derivations with it: the holder is
-/// classified `Unpaid` rather than `Grace` — closing the download and
-/// erase their terms promised for another six weeks — and
-/// `post_grace_due` returns empty forever, so the bytes are never
-/// expired at all. Deleting a record early is not a cheaper version of
-/// deleting it on time; it is deleting the evidence of an obligation
-/// while the obligation is still running.
+/// The full entitlement record while there is one; the derived
+/// `LapseState` after §15's bound has taken it. Both `evaluate` and
+/// `post_grace_due` go through here so the two cannot drift — a
+/// fallback that only one of them takes is how a holder ends up in
+/// grace on the request path and expired by the sweep in the same hour.
 ///
-/// So the floor is expiry, plus the longest `notice + grace` any terms
-/// document this operator has published declares, plus one
-/// revocation-epoch interval. The first term covers the derivation, the
-/// second covers a revocation landing just before expiry.
-///
-/// The longest across *all* published terms rather than the current
-/// ones, because a snapshot keeps the terms it was accepted under
-/// (§5.4): the document governing the oldest retained snapshot may
-/// promise a longer window than the one this operator publishes today,
-/// and it is that promise the record has to outlive.
-///
-/// One record class, not two. The alternative — sweeping on time and
-/// caching the derived lapse elsewhere — replaces a record §15 already
-/// declares with a per-holder payment flag that would need declaring
-/// too, and that can only ever disagree with the derivation it stands
-/// in for. Holding one row a while longer and saying so is the smaller
-/// claim.
-pub fn record_floor(
+/// The record wins where both exist. The derived row is a summary
+/// written at sweep time; the record is the credential itself, and a
+/// renewal lands there first.
+fn lifecycle_horizon(
     store: &Store,
-    revocation_poll_secs: i64,
-    now: OffsetDateTime,
-) -> Result<OffsetDateTime> {
-    let mut longest = 0i64;
-    for terms_id in store.published_terms_ids()? {
-        let Some(clause) = end_of_payment(store, &terms_id)? else {
+    handle: &str,
+    revoked: &HashSet<String>,
+) -> Result<Option<OffsetDateTime>> {
+    let text = match store.entitlement_horizon(handle, revoked)? {
+        Some(horizon) => horizon.lifecycle,
+        None => match store.lapse_state(handle)? {
+            Some(state) => state.lapsed_at,
+            None => return Ok(None),
+        },
+    };
+    OffsetDateTime::parse(&text, &Rfc3339)
+        .map(Some)
+        .map_err(|e| Error::Internal(format!("stored lapse horizon: {e}")))
+}
+
+/// §15's bound on an entitlement record: `expiresAt` plus one
+/// revocation-epoch interval, and the cutoff `sweep_entitlements`
+/// deletes below.
+///
+/// The interval is the only term, and it is there for the one reason
+/// §10.4 gives: an entitlement revoked just before it expired must stay
+/// recognisable for at least as long as it takes the next epoch to say
+/// so.
+///
+/// **This used to add the longest notice-and-grace this operator had
+/// ever published**, so that the record would still be there for
+/// `evaluate` and `post_grace_due` to derive from. The problem it
+/// solved is real — a record swept mid-grace closes a download the
+/// terms promise for another six weeks and leaves `post_grace_due` with
+/// nothing, so the bytes are held forever — but the remedy exceeded a
+/// normative bound and then declared its way out of it. §15's table is
+/// not advisory, and `metadataRetention` is a disclosure, not a
+/// licence. What the derivation needs is a timestamp; what that
+/// implementation kept was a signed credential naming an offer, an
+/// issuer and a purchase, for six weeks after it stopped being usable.
+///
+/// The horizon now moves into `store::LapseState` before the record is
+/// dropped — see `derive_lapse_state`. Four fields instead of a
+/// credential, and this floor goes back to the table.
+///
+/// Takes no store: the floor no longer depends on anything published,
+/// which is most of the point.
+pub fn record_floor(revocation_poll_secs: i64, now: OffsetDateTime) -> Result<OffsetDateTime> {
+    now.checked_sub(time::Duration::seconds(revocation_poll_secs))
+        .ok_or_else(|| Error::Internal("entitlement record floor is out of range".into()))
+}
+
+/// Reduce a lapsed holder's entitlement records to the minimum needed
+/// to finish honouring §10.3, ahead of dropping them.
+///
+/// Returns `None` for a holder with nothing to protect. That is the
+/// common case and it matters: a holder with no live snapshot is owed
+/// no notice, no grace and no post-grace action, so there is nothing
+/// for a row to carry and none is written. Retention state for someone
+/// the operator holds nothing about is just a record of a person.
+///
+/// `grace_expires_at` is the latest window end across their snapshots
+/// and bounds the row itself — it is not what any decision is made
+/// from. Each snapshot's own window is recomputed from its own pinned
+/// terms every time, before and after the record goes, because §10.3
+/// governs each snapshot by the terms it was accepted under and a
+/// holder-wide date would hand the older ones a window they never
+/// agreed to in one direction or the other.
+pub fn derive_lapse_state(
+    store: &Store,
+    handle: &str,
+    revoked: &HashSet<String>,
+) -> Result<Option<crate::store::LapseState>> {
+    let Some(lapsed_at) = lifecycle_horizon(store, handle, revoked)? else {
+        return Ok(None);
+    };
+
+    let mut latest: Option<(OffsetDateTime, String)> = None;
+    for row in store.snapshots(handle)? {
+        let Some(clause) = end_of_payment(store, &row.accepted_terms_id)? else {
             continue;
         };
-        // Unreadable or absent clauses contribute nothing rather than
-        // shortening the floor: `end_of_payment` has already said so
-        // out loud, and the failure mode of keeping a row too long is
-        // one an operator can declare.
-        longest = longest.max(clause.notice_secs.saturating_add(clause.grace_secs));
+        let Some(ends) = clause.window_end(lapsed_at) else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(held, _)| ends > *held) {
+            latest = Some((ends, clause.after_grace.clone()));
+        }
     }
-    now.checked_sub(time::Duration::seconds(
-        longest.saturating_add(revocation_poll_secs),
-    ))
-    .ok_or_else(|| Error::Internal("entitlement record floor is out of range".into()))
+    let Some((ends, after_grace)) = latest else {
+        return Ok(None);
+    };
+
+    let stamp = |at: OffsetDateTime| {
+        at.format(&Rfc3339)
+            .map_err(|e| Error::Internal(format!("format timestamp: {e}")))
+    };
+    Ok(Some(crate::store::LapseState {
+        lapsed_at: stamp(lapsed_at)?,
+        grace_expires_at: stamp(ends)?,
+        post_grace_action: after_grace,
+    }))
 }
 
 /// The gate every §9 route passes through.
@@ -533,21 +600,27 @@ mod tests {
         (harness, snapshot, credential)
     }
 
-    /// Move the registered entitlement's expiry into the past, which is
-    /// the only thing lapse is ever derived from.
+    /// Move the lapse horizon into the past.
+    ///
+    /// Both tables, because after §15's bound has taken the credential
+    /// the derived row is the horizon — a helper that moved only the
+    /// records would silently stop moving anything, and a test asserting
+    /// on a clock that never advanced passes for the wrong reason.
+    /// `grace_expires_at` moves with it at the default terms' 14 + 30.
     async fn lapsed_days_ago(harness: &Harness, days: i64) {
-        let at = (OffsetDateTime::now_utc() - time::Duration::days(days))
-            .format(&Rfc3339)
+        let lapsed = OffsetDateTime::now_utc() - time::Duration::days(days);
+        let at = lapsed.format(&Rfc3339).unwrap();
+        let ends = (lapsed + time::Duration::days(44)).format(&Rfc3339).unwrap();
+        let store = harness.state.store.lock().await;
+        store
+            .connection_for_tests()
+            .execute("UPDATE holder_entitlements SET expires_at = ?1", [&at])
             .unwrap();
-        harness
-            .state
-            .store
-            .lock()
-            .await
+        store
             .connection_for_tests()
             .execute(
-                "UPDATE holder_entitlements SET expires_at = ?1",
-                [at],
+                "UPDATE lapse_state SET lapsed_at = ?1, grace_expires_at = ?2",
+                rusqlite::params![&at, &ends],
             )
             .unwrap();
     }
@@ -779,31 +852,34 @@ mod tests {
         );
     }
 
-    /// The sweep must not delete the record its own next decision
-    /// depends on.
+    /// The record goes at §15's bound; the *horizon* survives it.
     ///
     /// Two passes against the real sweep, because the failure is
     /// invisible in either one alone. `expires_at` is the moment the
     /// holder lapsed — the grace window and the post-grace expiry are
-    /// both computed from it — so a record swept an hour after expiry
-    /// takes both with it: the download the terms promise for another
-    /// six weeks closes immediately, and nothing is ever expired
-    /// afterwards, which is the operator holding the bytes forever
-    /// while believing it tidied up.
+    /// both computed from it — so a record dropped an hour after expiry
+    /// with nothing behind it takes both with it: the download the
+    /// terms promise for another six weeks closes immediately, and
+    /// nothing is ever expired afterwards, which is the operator
+    /// holding the bytes forever while believing it tidied up.
+    ///
+    /// The earlier fix kept the whole credential for the length of the
+    /// window. This one keeps four fields, so the assertions run in
+    /// both directions: the record must be *gone* at §15's bound, and
+    /// everything derived from it must still work for six weeks after.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_record_outlives_the_grace_it_is_derived_from() {
+    async fn the_horizon_outlives_the_record_it_came_from() {
         let (harness, snapshot, _) = holder_with_a_snapshot().await;
         let hex_digest = hex::encode(Sha256::digest(&snapshot));
 
-        // The default poll interval, which is the only term of the
-        // floor that would be there if the record were not what lapse
-        // is read from.
+        // The poll interval is now the whole of the floor, which is
+        // what §15's table says it should be.
         let poll = crate::config::Config::for_tests("onym:component:test", vec![])
             .revocation_poll_secs as i64;
         let sweep_now = |harness: &Harness| {
             let at = OffsetDateTime::now_utc();
             tokio::task::block_in_place(|| {
-                let floor = record_floor(&harness.state.store.blocking_lock(), poll, at)
+                let floor = record_floor(poll, at)
                     .unwrap()
                     .format(&Rfc3339)
                     .unwrap();
@@ -825,26 +901,51 @@ mod tests {
             })
         };
 
-        // (1) An hour past expiry — the point at which the first sweep
-        // after a lapse runs. The record must survive it.
+        // (1) An hour past expiry — the first sweep after a lapse, and
+        // past `expiresAt` plus the poll interval. The credential goes
+        // here, on time, and its `entitlementId`, `offerId`, issuer and
+        // raw bytes go with it.
         lapsed_days_ago(&harness, 1).await;
         let swept = sweep_now(&harness);
-        assert_eq!(swept.aged_entitlements, 0, "the record lapse is derived from was swept mid-grace");
+        assert_eq!(
+            swept.aged_entitlements, 1,
+            "the credential was held past §15's bound"
+        );
+        assert!(
+            !harness
+                .state
+                .store
+                .lock()
+                .await
+                .has_entitlement_record(&harness.handle())
+                .unwrap(),
+            "an entitlement record survived its normative bound"
+        );
         assert_eq!(swept.post_grace_snapshots, 0);
 
-        // Which is the same thing as saying grace still works: the
-        // holder is in `Grace`, not `Unpaid`, and downloads what their
-        // terms promised.
+        // And the window it opened is still running: the holder is in
+        // `Grace`, not `Unpaid`, and downloads what their terms
+        // promised — from four derived fields rather than from a
+        // credential.
+        let derived = harness
+            .state
+            .store
+            .lock()
+            .await
+            .lapse_state(&harness.handle())
+            .unwrap()
+            .expect("the horizon went with the record");
+        assert_eq!(derived.post_grace_action, "erase");
         let (status, _) = harness
             .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
             .await;
         assert_eq!(status, StatusCode::OK, "the sweep ended a grace window 43 days early");
 
-        // (2) Past notice plus grace. Now the window really is over,
-        // and the snapshot is expired *from that same record* — the
-        // half that goes silent rather than loud when the record is
-        // gone, because an empty `post_grace_due` looks exactly like
-        // nothing being due.
+        // (2) Past notice plus grace. The window really is over, and
+        // the snapshot is expired from the derived state — the half
+        // that goes silent rather than loud when the horizon is lost,
+        // because an empty `post_grace_due` looks exactly like nothing
+        // being due.
         lapsed_days_ago(&harness, 50).await;
         let swept = sweep_now(&harness);
         assert_eq!(swept.post_grace_snapshots, 1, "the post-grace expiry never fired");
@@ -863,9 +964,133 @@ mod tests {
             "the bytes outlived the retention that justified holding them"
         );
 
-        // And only now, in the pass that acted on it, does the record
-        // itself go — 50 days is past 44 plus a poll interval.
-        assert_eq!(swept.aged_entitlements, 1, "the record was kept past every window it could open");
+        // (3) And the derived row does not outlive its purpose either.
+        // It is retired in the same pass that acted on it, because
+        // retirement is conditioned on nothing being due rather than on
+        // a clock — which is also what makes a transient failure in the
+        // expiry step recoverable rather than permanent: a snapshot
+        // that was not expired is still due, so the row would stay.
+        assert_eq!(
+            swept.forgotten_lapse_state, 1,
+            "the derived lapse state outlived the window it recorded"
+        );
+        assert!(
+            harness
+                .state
+                .store
+                .lock()
+                .await
+                .lapse_state(&harness.handle())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Access and lifecycle are two questions, and the store used to
+    /// answer both with whichever record won the first one.
+    ///
+    /// An unrevoked credential expiring at t1, and a revoked renewal
+    /// expiring at t2 > t1. The unrevoked answer won outright, so t2 was
+    /// discarded and every window ran from t1 — expiring the snapshot up
+    /// to `t2 - t1` early, and contradicting the rule that a revoked
+    /// record still contributes its declared `expiresAt` to the
+    /// lifecycle of the snapshots accepted under it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_renewal_still_sets_the_lifecycle_horizon() {
+        let (harness, snapshot, _) = holder_with_a_snapshot().await;
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+
+        // `ent-1` is the unrevoked original. Age it out — it expired
+        // yesterday, so it can grant nothing.
+        lapsed_days_ago(&harness, 1).await;
+        // `ent-2` is a renewal that was refunded: revoked, and declaring
+        // an `expiresAt` twenty days out.
+        let renewal_expiry = (OffsetDateTime::now_utc() + time::Duration::days(20))
+            .format(&Rfc3339)
+            .unwrap();
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .connection_for_tests()
+            .execute(
+                "INSERT INTO holder_entitlements
+                    (entitlement_id, holder_handle, offer_id, not_before, expires_at,
+                     quota_units, quota_unit, quota_consumed, raw, registered_at)
+                 VALUES ('ent-2', ?1, 'backup-monthly-v1', '2020-01-01T00:00:00Z', ?2,
+                         NULL, NULL, 0, X'00', '2020-01-01T00:00:00Z')",
+                rusqlite::params![harness.handle(), renewal_expiry],
+            )
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        harness.state.revocation.install(
+            crate::revocation::Epoch {
+                epoch: 1,
+                published_at: now,
+                revoked: HashSet::from(["ent-2".to_string()]),
+                raw: Vec::new(),
+            },
+            now,
+        );
+
+        // **Access** is refused. The only unrevoked record expired
+        // yesterday, and the revoked renewal grants nothing however far
+        // out its own `expiresAt` still is.
+        let terms = harness.terms_id();
+        let fresh: Vec<u8> = (100..120u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&fresh, &terms))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "a revoked renewal bought new paid work"
+        );
+
+        // **Lifecycle** runs from the renewal. Grace is 20 days out
+        // plus notice-and-grace, so at 50 days past the *original*
+        // expiry — long past 44 — the snapshot is still protected and
+        // nothing is due.
+        let revoked = harness.state.revocation.revoked();
+        let due = tokio::task::block_in_place(|| {
+            post_grace_due(
+                &harness.state.store.blocking_lock(),
+                &harness.handle(),
+                &revoked,
+                OffsetDateTime::now_utc() + time::Duration::days(50),
+            )
+            .unwrap()
+        });
+        assert!(
+            due.is_empty(),
+            "post-grace expiry ran from the older unrevoked record and fired 20 days early"
+        );
+
+        // Still downloadable today, for the same reason.
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "grace ran from the older record and closed early"
+        );
+
+        // And past the renewal's own window — 20 days out plus 44 — it
+        // is finally due. Same call, later clock: the horizon really is
+        // t2 and not merely "later than t1".
+        let due = tokio::task::block_in_place(|| {
+            post_grace_due(
+                &harness.state.store.blocking_lock(),
+                &harness.handle(),
+                &revoked,
+                OffsetDateTime::now_utc() + time::Duration::days(70),
+            )
+            .unwrap()
+        });
+        assert_eq!(due.len(), 1, "the snapshot was never due at all");
+        assert_eq!(due[0].1, "erase");
     }
 
     /// Revocation must not erase the timestamp the rest of lapse is
@@ -932,7 +1157,7 @@ mod tests {
             let at = OffsetDateTime::now_utc();
             let revoked = harness.state.revocation.revoked();
             tokio::task::block_in_place(|| {
-                let floor = record_floor(&harness.state.store.blocking_lock(), poll, at)
+                let floor = record_floor(poll, at)
                     .unwrap()
                     .format(&Rfc3339)
                     .unwrap();

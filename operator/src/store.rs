@@ -38,6 +38,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
+        self.retire_old_lapse_state()?;
         self.connection.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -193,15 +194,54 @@ impl Store {
                 PRIMARY KEY (holder_handle, nonce)
             );
 
-            -- There is no `lapse_state` table, and that absence is
-            -- deliberate. Lapse is *derived* — from the newest
-            -- unrevoked entitlement's expiry, and then per snapshot
-            -- from the `endOfPayment` clause of its own pinned terms
-            -- (§10.3). A cached copy would be a per-holder payment
-            -- record that nothing reads and §15 would have to declare,
-            -- and it can only ever disagree with the derivation.
-            -- Earlier schemas created one; it was never written to.
-            DROP TABLE IF EXISTS lapse_state;
+            -- The minimum this operator remembers about a holder whose
+            -- entitlement records have aged out from under a grace
+            -- window that is still running.
+            --
+            -- **An earlier version of this comment said there is no
+            -- such table, and that its absence was a design commitment:
+            -- a cached lapse flag would be a per-holder payment record
+            -- nothing reads. That reasoning did not survive contact
+            -- with §15's bound, and this replaces it rather than being
+            -- quietly dropped.** It assumed the full entitlement record
+            -- would still be there to derive from. §15's table bounds
+            -- that record at `expiresAt` plus one revocation-epoch
+            -- interval — a quarter of an hour, in the default
+            -- configuration — while the notice-and-grace it opens runs
+            -- for weeks. Something has to carry the horizon across that
+            -- gap. The choice was never "derive or cache"; it was "keep
+            -- the whole credential for 44 days, or keep four fields",
+            -- and four fields is the smaller claim.
+            --
+            -- So this table *is* read, and once the record ages out it
+            -- is the only thing left to read: `lapse::evaluate` and
+            -- `lapse::post_grace_due` both fall back to `lapsed_at`
+            -- here, and both still recompute each snapshot's own window
+            -- from its own pinned terms, so §10.3 is unchanged.
+            --
+            -- It is deliberately not a copy of the record. There is no
+            -- `entitlement_id`, no `offer_id`, no issuer, no offer, no
+            -- raw credential — a credential retained for six weeks is
+            -- the per-holder payment diary §15 exists to prevent, where
+            -- "this holder lapsed at T, the last window they were
+            -- promised ends at G, and then the bytes go" says nothing
+            -- about what they bought or from whom.
+            --
+            -- Written only for a holder with snapshots to protect, and
+            -- deleted once `grace_expires_at` has passed with nothing
+            -- left due — see `sweep`. It must not outlive its purpose,
+            -- which is the standard every other row here is held to.
+            --
+            -- §15's table has no class for post-lapse lifecycle state
+            -- at all; onymchat/onym-system#41 raises that gap.
+            -- `metadataRetention.lapseState` declares this as an
+            -- extension in the meantime, and says so out loud.
+            CREATE TABLE IF NOT EXISTS lapse_state (
+                holder_handle     TEXT PRIMARY KEY,
+                lapsed_at         TEXT NOT NULL,
+                grace_expires_at  TEXT NOT NULL,
+                post_grace_action TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS revocation_cache (
                 epoch      INTEGER PRIMARY KEY,
@@ -212,6 +252,32 @@ impl Store {
         )?;
 
         self.migrate_operation_outcomes()?;
+        Ok(())
+    }
+
+    /// Drop a `lapse_state` table left over from a pre-release schema.
+    ///
+    /// Two shapes have carried this name. A much older one was created
+    /// and never written to; the release before this one dropped it
+    /// unconditionally at boot. A store that skips that release comes
+    /// straight here, and `CREATE TABLE IF NOT EXISTS` would leave the
+    /// stale shape in place and then fail on the first insert. Dropping
+    /// unconditionally is not an option any more — the table now holds
+    /// the only record of a running grace window, and a boot that
+    /// discards it ends every lapsed holder's notice-and-grace early.
+    ///
+    /// So the drop is conditioned on the shape: a table without
+    /// `post_grace_action` is the old one, which held nothing, and a
+    /// table with it is this one, which holds something.
+    fn retire_old_lapse_state(&self) -> Result<()> {
+        let columns: Vec<String> = self
+            .connection
+            .prepare("PRAGMA table_info(lapse_state)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !columns.is_empty() && !columns.iter().any(|column| column == "post_grace_action") {
+            self.connection.execute("DROP TABLE lapse_state", [])?;
+        }
         Ok(())
     }
 
@@ -541,34 +607,26 @@ impl Store {
                 now,
             ],
         )?;
+        // A holder presenting a live credential has not lapsed, so any
+        // derived lifecycle state about them is now a record of
+        // something that is not happening. Clearing it here is what
+        // keeps "there is no lapse flag to clear" true from the outside:
+        // the flag exists, but nothing reads it while a record does.
+        self.forget_lapse_state(handle)?;
         Ok(())
     }
 
-    /// The latest `expiresAt` among this holder's registered
-    /// entitlements, and whether that record is itself revoked.
+    /// Both horizons for one holder, or `None` when there is no record
+    /// at all.
     ///
-    /// The *latest*, not the first found: a holder who renewed early
-    /// holds two credentials at once, and lapsing them on the older
-    /// one's expiry would cut off someone who has already paid for the
-    /// next period. Revoked records are preferred out of that choice —
-    /// a refunded entitlement that still sat in the table must not hold
-    /// a live one's protection off — but never dropped outright: if
-    /// every record is revoked, the latest revoked `expiresAt` is
-    /// returned rather than nothing, with the flag set so the caller
-    /// stops trusting it for new access without losing the timestamp
-    /// lapse, grace and the sweep all derive from.
-    ///
-    /// Returning `None` here when a revoked record was the holder's
-    /// only one used to erase that timestamp entirely: `evaluate` fell
-    /// straight to `Lapsed`, skipping the grace a still-unexpired
-    /// credential's terms had already promised, and `post_grace_due`
-    /// had nothing to derive from and returned empty forever, so the
-    /// snapshot's bytes were never expired at all.
+    /// `None` is "this operator holds nothing about this holder's
+    /// payment", which the caller must not read as "lapsed now" — see
+    /// `lapse_state`, which is what remains after the records age out.
     pub fn entitlement_horizon(
         &self,
         handle: &str,
         revoked: &HashSet<String>,
-    ) -> Result<Option<(String, bool)>> {
+    ) -> Result<Option<EntitlementHorizon>> {
         let mut statement = self.connection.prepare(
             "SELECT entitlement_id, expires_at FROM holder_entitlements
              WHERE holder_handle = ?1",
@@ -590,10 +648,104 @@ impl Store {
                 live = Some((at, expires_at));
             }
         }
-        Ok(match live {
-            Some((_, text)) => Some((text, false)),
-            None => any.map(|(_, text)| (text, true)),
-        })
+        Ok(any.map(|(_, lifecycle)| EntitlementHorizon {
+            access: live.map(|(_, text)| text),
+            lifecycle,
+        }))
+    }
+
+    /// Holders whose every entitlement record is below the floor, and
+    /// which the next `sweep_entitlements` will therefore leave with
+    /// nothing.
+    ///
+    /// `HAVING MAX(...)` rather than a per-row test: a holder with one
+    /// old record and one current one is not losing their horizon, and
+    /// deriving lapse state for them would write a lapse that has not
+    /// happened.
+    pub fn holders_losing_entitlements(&self, older_than: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT holder_handle FROM holder_entitlements
+             GROUP BY holder_handle
+             HAVING MAX(julianday(expires_at)) < julianday(?1)",
+        )?;
+        let rows = statement.query_map([older_than], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Persist the derived lifecycle state for a lapsed holder.
+    ///
+    /// `INSERT OR REPLACE`, so a later pass that finds a longer window
+    /// — a snapshot committed on a grant that outlived the lapse pins
+    /// its own terms — widens the row rather than being ignored.
+    pub fn record_lapse_state(&self, handle: &str, state: &LapseState) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO lapse_state
+                (holder_handle, lapsed_at, grace_expires_at, post_grace_action)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                handle,
+                state.lapsed_at,
+                state.grace_expires_at,
+                state.post_grace_action
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// What is left once the entitlement records have gone.
+    pub fn lapse_state(&self, handle: &str) -> Result<Option<LapseState>> {
+        self.connection
+            .query_row(
+                "SELECT lapsed_at, grace_expires_at, post_grace_action
+                   FROM lapse_state WHERE holder_handle = ?1",
+                [handle],
+                |row| {
+                    Ok(LapseState {
+                        lapsed_at: row.get(0)?,
+                        grace_expires_at: row.get(1)?,
+                        post_grace_action: row.get(2)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Every holder carrying derived lifecycle state, so the sweep can
+    /// retire the rows that have served their purpose.
+    pub fn lapsed_holders(&self) -> Result<Vec<(String, LapseState)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT holder_handle, lapsed_at, grace_expires_at, post_grace_action
+               FROM lapse_state",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                LapseState {
+                    lapsed_at: row.get(1)?,
+                    grace_expires_at: row.get(2)?,
+                    post_grace_action: row.get(3)?,
+                },
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Forget a holder's derived lifecycle state.
+    ///
+    /// Called from two places, for two reasons. The sweep calls it when
+    /// the window has closed and been acted on — the row's purpose is
+    /// over. `register_entitlement` calls it because a holder who
+    /// presents a live credential has not lapsed, and a stale row would
+    /// be the operator holding a lapse record about someone who is
+    /// paying.
+    pub fn forget_lapse_state(&self, handle: &str) -> Result<usize> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM lapse_state WHERE holder_handle = ?1", [handle])?)
     }
 
     /// Whether this holder has ever registered an entitlement.
@@ -612,32 +764,39 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Discard entitlement records past the declared window.
+    /// Discard entitlement records past §15's bound.
     ///
-    /// The caller computes the floor — `lapse::record_floor` — and
-    /// `metadataRetention.entitlementRecords` declares exactly what it
-    /// computes: expiry, plus the longest notice-and-grace this
-    /// operator has ever published, plus one revocation-epoch interval.
+    /// The floor is `lapse::record_floor`: `expiresAt` plus one
+    /// revocation-epoch interval, which is what §15's table says and
+    /// nothing more. The epoch interval is there because an entitlement
+    /// revoked just before it expired must stay recognisable for at
+    /// least as long as it takes the next epoch to say so.
     ///
-    /// The epoch interval is in there because an entitlement revoked
-    /// just before it expired must stay recognisable for at least as
-    /// long as it takes the next epoch to say so. The notice-and-grace
-    /// term is in there because **this row is what lapse is derived
-    /// from**: `lapse::evaluate` and `lapse::post_grace_due` both read
-    /// `expires_at` as the moment the holder lapsed. Deleting it at
-    /// expiry plus the poll interval — an hour, in the default
-    /// configuration — would end a 44-day grace window on the first
-    /// sweep after expiry and, worse, leave `post_grace_due` with
-    /// nothing to derive from, so the snapshot would never be expired
-    /// and the operator would hold the bytes forever.
+    /// **An earlier version of this held the record for `expiresAt`
+    /// plus the longest notice-and-grace this operator had ever
+    /// published, plus the epoch interval, and widened the
+    /// `metadataRetention.entitlementRecords` self-declaration to
+    /// match.** The reasoning was sound about the problem — the record
+    /// is what lapse is derived from, and dropping it mid-grace ends
+    /// the window early and leaves `post_grace_due` with nothing — and
+    /// wrong about the remedy. §15's bound is normative; declaring a
+    /// longer one does not authorize holding for it, and §18.24 asks
+    /// what the operator holds, not what it says. A signed credential,
+    /// its `entitlementId`, its `offerId` and its issuer, kept for six
+    /// weeks after it stopped being usable, is the per-holder payment
+    /// diary §15 exists to prevent.
     ///
-    /// Once the row goes, every window it could have opened is closed
-    /// and every action it could have triggered has been taken, which
-    /// is the condition a retention bound is supposed to express.
-    pub fn sweep_entitlements(&self, older_than: &str) -> Result<usize> {
+    /// So the fix is to hold less rather than declare more: the sweep
+    /// derives `LapseState` first — four fields, none of them about
+    /// what was bought or from whom — and the full record goes on time.
+    /// Scoped to one holder, because the caller has just written that
+    /// holder's successor state and a table-wide `DELETE` would take
+    /// the records of holders it has not written one for.
+    pub fn sweep_entitlements(&self, handle: &str, older_than: &str) -> Result<usize> {
         Ok(self.connection.execute(
-            "DELETE FROM holder_entitlements WHERE julianday(expires_at) < julianday(?1)",
-            [older_than],
+            "DELETE FROM holder_entitlements
+             WHERE holder_handle = ?1 AND julianday(expires_at) < julianday(?2)",
+            rusqlite::params![handle, older_than],
         )?)
     }
 
@@ -698,18 +857,6 @@ impl Store {
             rusqlite::params![terms_id, raw, signature, now],
         )?;
         Ok(())
-    }
-
-    /// Every terms document this operator has ever published.
-    ///
-    /// Every one of them, not just the current pair: a snapshot pins
-    /// the terms it was accepted under, so an older document with a
-    /// longer `endOfPayment` still governs something on disk and still
-    /// bounds how long the records it is read against must be kept.
-    pub fn published_terms_ids(&self) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare("SELECT terms_id FROM terms_documents")?;
-        let rows = statement.query_map([], |row| row.get(0))?;
-        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
     }
 
     /// A published terms document by id, with its detached signature.
@@ -1163,6 +1310,61 @@ impl Store {
         )?;
         Ok(count > 0)
     }
+}
+
+/// The two horizons a holder's entitlement records imply, which are not
+/// the same horizon and used to be collapsed into one.
+///
+/// Both are the *latest* of their kind, never the first found: a holder
+/// who renewed early holds two credentials at once, and working from the
+/// older one's expiry would cut off someone who has already paid for the
+/// next period.
+pub struct EntitlementHorizon {
+    /// **May this holder do new paid work.** The latest `expiresAt`
+    /// among records that are *not* revoked, or `None` when every record
+    /// is. Revocation blocks new work from the moment the epoch says so,
+    /// which is why a revoked record contributes nothing here even while
+    /// its own `expiresAt` is still in the future.
+    pub access: Option<String>,
+    /// **When this holder lapsed**, for notice, grace, and post-grace
+    /// expiry. The latest `expiresAt` across *every* record, revoked
+    /// ones included.
+    ///
+    /// Revoked records count here because a refunded credential's
+    /// declared `expiresAt` still governs what the snapshots accepted
+    /// under it were promised. The operator is not the seller and is not
+    /// undoing the sale; it is honouring terms a person consented to
+    /// when they handed over bytes.
+    ///
+    /// Collapsing the two lost exactly this. With an unrevoked record
+    /// expiring at t1 and a revoked renewal expiring at t2 > t1, the
+    /// unrevoked answer won outright and t2 was discarded, so grace and
+    /// post-grace expiry both ran from t1 and every snapshot was
+    /// expired up to `t2 - t1` early.
+    pub lifecycle: String,
+}
+
+/// The whole of what this operator remembers about a lapse once the
+/// entitlement records behind it have aged out.
+///
+/// Four fields, and the omissions are the point — no `entitlementId`,
+/// no `offerId`, no issuer, no offer, no credential bytes. See the
+/// `lapse_state` schema comment for why this exists at all.
+pub struct LapseState {
+    /// The lifecycle horizon at the moment the records went: the
+    /// timestamp `lapse::evaluate` and `lapse::post_grace_due` derive
+    /// from once there is nothing else to derive from.
+    pub lapsed_at: String,
+    /// The latest `notice + grace` end across this holder's snapshots —
+    /// the row's own bound, not a decision input. Each snapshot's window
+    /// is still recomputed from its own pinned terms (§10.3); collapsing
+    /// that to one holder-wide date is the mistake §10.3 spends three
+    /// paragraphs warning about.
+    pub grace_expires_at: String,
+    /// The `afterGrace` state those terms declare. Read when the row is
+    /// retired: a state this operator does not implement means the
+    /// promise the row records has not been honoured, and the row stays.
+    pub post_grace_action: String,
 }
 
 /// An upload in flight.

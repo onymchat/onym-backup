@@ -32,6 +32,7 @@ use crate::store::Store;
 pub struct Swept {
     pub post_grace_snapshots: usize,
     pub aged_entitlements: usize,
+    pub forgotten_lapse_state: usize,
     pub expired_grants: usize,
     pub orphan_incoming: usize,
     pub orphan_snapshots: usize,
@@ -48,9 +49,9 @@ pub struct Cutoffs<'a> {
     pub outcome: &'a str,
     pub receipt: &'a str,
     pub erased_reference: &'a str,
-    /// Entitlement records past `expiry plus one revocation-epoch
-    /// interval`, which is what `metadataRetention.entitlementRecords`
-    /// declares.
+    /// Entitlement records past `expiresAt` plus one revocation-epoch
+    /// interval — §15's normative bound, and what
+    /// `metadataRetention.entitlementRecords` declares.
     pub entitlement: &'a str,
 }
 
@@ -80,6 +81,7 @@ pub fn reconcile(
     let mut swept = Swept {
         post_grace_snapshots: 0,
         aged_entitlements: 0,
+        forgotten_lapse_state: 0,
         expired_grants: 0,
         orphan_incoming: 0,
         orphan_snapshots: 0,
@@ -229,20 +231,108 @@ pub fn reconcile(
         }
     }
 
-    // (3b) Entitlement records past what `metadataRetention`
-    // declares. A window nothing enforces is a window in name only.
+    // (3b) Entitlement records past §15's bound — `expiresAt` plus one
+    // revocation-epoch interval — and the derived lifecycle state that
+    // takes over from them. A window nothing enforces is a window in
+    // name only, and this is the one whose bound is normative rather
+    // than self-declared.
     //
-    // **After step (0), and that ordering is load-bearing.** The record
-    // is what step (0) derives lapse from, and the floor
-    // (`lapse::record_floor`) is the last grace window it can open plus
-    // one poll interval — so the pass that first finds a record old
-    // enough to delete is the pass that has just acted on it. Sweeping
-    // records first would, on that one pass, leave the snapshot whose
-    // window had closed with nothing left to expire it from, and it
-    // would be held forever.
-    match store.blocking_lock().sweep_entitlements(entitlement_floor) {
-        Ok(count) => swept.aged_entitlements += count,
-        Err(error) => tracing::warn!(%error, "could not sweep entitlement records"),
+    // Derive first, then delete. The record is what lapse is read from,
+    // and §15's bound falls due long before the grace it opened runs
+    // out, so something must carry the horizon across: four fields
+    // saying when the holder lapsed and when the last window they were
+    // promised ends. Not the credential, not the `entitlementId`, not
+    // the offer or the issuer — see `store::LapseState`.
+    //
+    // Per holder rather than one statement over the table, so a
+    // derivation that fails leaves that holder's records in place
+    // rather than dropping them with nothing behind them.
+    //
+    // **The step order no longer carries anything.** It used to: the
+    // old floor was the last grace window plus one poll interval, so
+    // the pass that first found a record deletable was the same pass
+    // that had to act on it, and a transient failure in step (0)
+    // orphaned the snapshot permanently. Now the horizon outlives the
+    // record by construction, and the derived row is retired in (3c)
+    // only once nothing is due from it.
+    let losing = match store
+        .blocking_lock()
+        .holders_losing_entitlements(entitlement_floor)
+    {
+        Ok(holders) => holders,
+        Err(error) => {
+            tracing::warn!(%error, "could not list holders losing entitlement records");
+            Vec::new()
+        }
+    };
+    for handle in losing {
+        let store = store.blocking_lock();
+        let derived = match crate::lapse::derive_lapse_state(&store, &handle, revoked) {
+            // Nothing retained, so nothing is owed a window: the record
+            // goes and leaves no successor, which is the point of
+            // holding lifecycle state only for holders who have
+            // something to lose.
+            Ok(None) => true,
+            Ok(Some(state)) => match store.record_lapse_state(&handle, &state) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, "could not persist derived lapse state");
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "could not derive lapse state");
+                false
+            }
+        };
+        if !derived {
+            continue;
+        }
+        match store.sweep_entitlements(&handle, entitlement_floor) {
+            Ok(count) => swept.aged_entitlements += count,
+            Err(error) => tracing::warn!(%error, "could not sweep entitlement records"),
+        }
+    }
+
+    // (3c) Derived lifecycle state that has outlived its purpose.
+    //
+    // Retired only when the last window it records has closed *and*
+    // nothing is still due from it. The second condition is what makes
+    // a transient failure in step (0) survivable: a `mark_unavailable`
+    // that failed leaves the snapshot in `post_grace_due`, so the row
+    // stays and the next pass tries again. The row's real bound is
+    // "once it has been acted on", which is the only bound that cannot
+    // strand a snapshot.
+    //
+    // A `post_grace_action` this operator does not implement keeps the
+    // row too, for the reason step (0) keeps the bytes: the promise it
+    // records has not been honoured, and forgetting it would be the
+    // operator tidying away the evidence of that.
+    let lapsed = match store.blocking_lock().lapsed_holders() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list derived lapse state");
+            Vec::new()
+        }
+    };
+    for (handle, state) in lapsed {
+        let closed = time::OffsetDateTime::parse(
+            &state.grace_expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok_and(|ends| now_at >= ends);
+        if !closed || state.post_grace_action != "erase" {
+            continue;
+        }
+        let store = store.blocking_lock();
+        match crate::lapse::post_grace_due(&store, &handle, revoked, now_at) {
+            Ok(due) if due.is_empty() => match store.forget_lapse_state(&handle) {
+                Ok(count) => swept.forgotten_lapse_state += count,
+                Err(error) => tracing::warn!(%error, "could not forget derived lapse state"),
+            },
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not re-check post-grace state"),
+        }
     }
 
     // (4) Snapshot directories with no row — the crash-between-rename-
