@@ -1,0 +1,32 @@
+# A built Rust tree is far larger than its source, and the whole build
+# context is uploaded to the builder. Without this, every deploy ships
+# target/ across the wire.
+operator/target/
+target/
+.git/
+.github/
+
+# Secrets, and the reason this list is not simply .gitignore:
+#
+# `COPY . .` uploads the context to whichever local or remote BuildKit
+# builder runs the build, and caches it there. Docker does not read
+# .gitignore, so a file excluded from git is NOT thereby excluded from
+# disclosure — and .gitignore's `*.env` made that easy to miss, because
+# the pattern reads as handled.
+#
+# These two lines cover what .gitignore covers today. They are not a
+# mirror of it and must not be maintained as one: `!*.env.example` is
+# deliberately absent, because an example file is harmless in a build
+# context and reproducing a negation is a way to get the pattern subtly
+# wrong for no benefit.
+.env
+*.env
+
+# Forward-looking, and matches nothing in this repo today. Kept anyway
+# because this repo deals in signing seeds — the operator's own, and the
+# discovery provider's on the branch that adds publishing tooling — and
+# a seed that reaches a cached build context has been disclosed before
+# anyone notices the file is new. A deny-pattern that costs nothing is
+# the right shape for that; a pattern added after the first mistake is
+# not.
+*.seed
