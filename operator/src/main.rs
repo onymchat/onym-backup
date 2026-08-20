@@ -23,11 +23,14 @@ mod auth;
 mod blobs;
 mod config;
 mod documents;
+mod entitlements;
 mod erasures;
 mod error;
 mod export;
+mod lapse;
 mod operations;
 mod payload;
+mod revocation;
 mod store;
 mod sweep;
 
@@ -117,6 +120,85 @@ async fn main() {
         }
     };
 
+    // The revocation epoch, before serving and then on its own
+    // schedule. Two rules from §10.4 shape this:
+    //
+    // - **A failed poll is not a refusal.** The last good epoch stays
+    //   in force. A broker outage must not delete anyone's access, and
+    //   the failure mode of a stale epoch is a refund honoured late —
+    //   which the terms' grace already absorbs. Staleness is published
+    //   in `/health` rather than converted into 402s.
+    // - **The cache survives a restart.** An operator that forgot every
+    //   revocation on reboot would honour a refund and then un-honour
+    //   it, so the epoch in force is read back from SQLite at boot.
+    if let Some(url) = state.config.revocation_url.clone() {
+        {
+            let store = state.store.lock().await;
+            match store.latest_epoch() {
+                Ok(Some((document, fetched_at))) => {
+                    match (
+                        revocation::parse(&document, &state.config),
+                        time::OffsetDateTime::parse(
+                            &fetched_at,
+                            &time::format_description::well_known::Rfc3339,
+                        ),
+                    ) {
+                        (Ok(epoch), Ok(at)) => {
+                            let number = epoch.epoch;
+                            state.revocation.install(epoch, at);
+                            tracing::info!(epoch = number, "revocation epoch restored from cache");
+                        }
+                        _ => tracing::warn!("cached revocation epoch did not verify; ignoring"),
+                    }
+                }
+                Ok(None) => tracing::info!("no cached revocation epoch"),
+                Err(error) => tracing::warn!(%error, "could not read cached revocation epoch"),
+            }
+        }
+
+        let state = state.clone();
+        let interval = state.config.revocation_poll_secs;
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                // Bounded so a hung broker cannot pin this task
+                // forever. Well under the poll interval, so a slow
+                // fetch is abandoned rather than overlapping the next.
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!(%error, "could not build revocation client");
+                    return;
+                }
+            };
+            loop {
+                match revocation::fetch(&client, &url, &state.config).await {
+                    Ok(epoch) => {
+                        let number = epoch.epoch;
+                        let revoked = epoch.revoked.len();
+                        let at = time::OffsetDateTime::now_utc();
+                        let document = epoch.raw.clone();
+                        if state.revocation.install(epoch, at) {
+                            let stamp = at
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_default();
+                            let store = state.store.lock().await;
+                            if let Err(error) = store.cache_epoch(number, &stamp, &document) {
+                                tracing::warn!(%error, "could not cache revocation epoch");
+                            }
+                            tracing::info!(epoch = number, revoked, "revocation epoch installed");
+                        }
+                    }
+                    // Warn, never refuse. The operator keeps serving on
+                    // the epoch it has.
+                    Err(error) => tracing::warn!(%error, "revocation poll failed; keeping last good epoch"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        });
+    }
+
     // Reconcile before serving, then hourly. Bytes and rows are
     // written in two steps, so a crash between them leaves one without
     // the other; this deletes bytes with no row and never invents a row
@@ -134,6 +216,12 @@ async fn main() {
         let outcome_window = state.config.outcome_retention_secs;
         let receipt_window = state.config.receipt_retention_secs;
         let erased_window = state.config.erased_reference_retention_secs;
+        // "to expiry plus one revocation-epoch interval" — the
+        // declaration in `metadataRetention.entitlementRecords`, and the
+        // interval is in there because an entitlement revoked just
+        // before it expired must stay recognisable at least as long as
+        // it takes the next epoch to say so.
+        let entitlement_window = state.config.revocation_poll_secs as i64;
         tokio::spawn(async move {
             loop {
                 let state = state.clone();
@@ -154,25 +242,31 @@ async fn main() {
                         let outcomes = at.checked_sub(time::Duration::seconds(outcome_window))?;
                         let receipts = at.checked_sub(time::Duration::seconds(receipt_window))?;
                         let erased = at.checked_sub(time::Duration::seconds(erased_window))?;
+                        let entitlements =
+                            at.checked_sub(time::Duration::seconds(entitlement_window))?;
                         Some((
                             stamp(at).ok()?,
                             stamp(floor).ok()?,
                             stamp(outcomes).ok()?,
                             stamp(receipts).ok()?,
                             stamp(erased).ok()?,
+                            stamp(entitlements).ok()?,
                         ))
                     })();
-                    stamped.map(|(now, floor, outcomes, receipts, erased)| {
+                    stamped.map(|(now, floor, outcomes, receipts, erased, entitlements)| {
                         sweep::reconcile(
                             &state.store,
                             &state.blob_mutations,
                             &state.blobs,
+                            &state.revocation.revoked(),
+                            at,
                             sweep::Cutoffs {
                                 now: &now,
                                 nonce: &floor,
                                 outcome: &outcomes,
                                 receipt: &receipts,
                                 erased_reference: &erased,
+                                entitlement: &entitlements,
                             },
                         )
                     })
@@ -181,7 +275,9 @@ async fn main() {
 
                 match swept {
                     Ok(Some(swept)) => {
-                        if swept.expired_grants
+                        if swept.post_grace_snapshots
+                            + swept.aged_entitlements
+                            + swept.expired_grants
                             + swept.orphan_incoming
                             + swept.orphan_snapshots
                             + swept.unavailable_snapshots
@@ -192,6 +288,8 @@ async fn main() {
                             > 0
                         {
                             tracing::info!(
+                                post_grace_snapshots = swept.post_grace_snapshots,
+                                aged_entitlements = swept.aged_entitlements,
                                 expired_grants = swept.expired_grants,
                                 orphan_incoming = swept.orphan_incoming,
                                 orphan_snapshots = swept.orphan_snapshots,

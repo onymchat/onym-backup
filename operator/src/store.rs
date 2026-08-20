@@ -193,15 +193,15 @@ impl Store {
                 PRIMARY KEY (holder_handle, nonce)
             );
 
-            -- Derived from entitlement expiry, never from a charge
-            -- failure — this operator is not the seller and has no
-            -- charge to fail.
-            CREATE TABLE IF NOT EXISTS lapse_state (
-                holder_handle     TEXT PRIMARY KEY,
-                lapsed_at         TEXT NOT NULL,
-                grace_expires_at  TEXT NOT NULL,
-                post_grace_action TEXT NOT NULL
-            );
+            -- There is no `lapse_state` table, and that absence is
+            -- deliberate. Lapse is *derived* — from the newest
+            -- unrevoked entitlement's expiry, and then per snapshot
+            -- from the `endOfPayment` clause of its own pinned terms
+            -- (§10.3). A cached copy would be a per-holder payment
+            -- record that nothing reads and §15 would have to declare,
+            -- and it can only ever disagree with the derivation.
+            -- Earlier schemas created one; it was never written to.
+            DROP TABLE IF EXISTS lapse_state;
 
             CREATE TABLE IF NOT EXISTS revocation_cache (
                 epoch      INTEGER PRIMARY KEY,
@@ -500,6 +500,165 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(Into::into)
+    }
+
+    /// Record a verified entitlement against a holder.
+    ///
+    /// Idempotent by `entitlementId` (§9.1), and the same call serves
+    /// the header path: a credential presented on a request is
+    /// registered exactly as one posted to §9.1's route would be.
+    /// Remembering it is not bookkeeping for its own sake — lapse
+    /// (§10.3) is derived from entitlement expiry, and an operator that
+    /// verified a credential and then forgot it has no way to know a
+    /// holder ever had one.
+    ///
+    /// `INSERT OR REPLACE` rather than `OR IGNORE`: a broker may
+    /// re-issue the same `entitlementId` with a later `expiresAt` on
+    /// renewal, and keeping the first copy would lapse a holder who
+    /// paid.
+    pub fn register_entitlement(
+        &self,
+        handle: &str,
+        entitlement: &crate::entitlements::VerifiedEntitlement,
+        now: &str,
+    ) -> Result<()> {
+        let stamp = |at: OffsetDateTime| -> Result<String> {
+            at.format(&Rfc3339)
+                .map_err(|e| Error::Internal(format!("format timestamp: {e}")))
+        };
+        self.connection.execute(
+            "INSERT OR REPLACE INTO holder_entitlements
+                (entitlement_id, holder_handle, offer_id, not_before, expires_at,
+                 quota_units, quota_unit, quota_consumed, raw, registered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 0, ?6, ?7)",
+            rusqlite::params![
+                entitlement.entitlement_id,
+                handle,
+                entitlement.offer_id,
+                stamp(entitlement.not_before)?,
+                stamp(entitlement.expires_at)?,
+                entitlement.raw,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The latest `expiresAt` among this holder's registered
+    /// entitlements, revoked ids excluded.
+    ///
+    /// The *latest*, not the first found: a holder who renewed early
+    /// holds two credentials at once, and lapsing them on the older
+    /// one's expiry would cut off someone who has already paid for the
+    /// next period.
+    ///
+    /// Revocation is applied here as well as at presentation because
+    /// this is what lapse reads. A refunded entitlement that still sat
+    /// in the table would hold lapse off indefinitely — the holder
+    /// would stop being able to upload (presentation refuses the
+    /// credential) while never entering grace, which is the worst of
+    /// both.
+    pub fn entitlement_horizon(
+        &self,
+        handle: &str,
+        revoked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT entitlement_id, expires_at FROM holder_entitlements
+             WHERE holder_handle = ?1",
+        )?;
+        let rows = statement.query_map([handle], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut horizon: Option<(OffsetDateTime, String)> = None;
+        for row in rows {
+            let (id, expires_at) = row?;
+            if revoked.contains(&id) {
+                continue;
+            }
+            let Ok(at) = OffsetDateTime::parse(&expires_at, &Rfc3339) else {
+                continue;
+            };
+            if horizon.as_ref().is_none_or(|(held, _)| at > *held) {
+                horizon = Some((at, expires_at));
+            }
+        }
+        Ok(horizon.map(|(_, text)| text))
+    }
+
+    /// Whether this holder has ever registered an entitlement.
+    ///
+    /// Distinguishes "never paid" from "paid and lapsed", which are
+    /// different refusals: the first is a `402` that starts the payment
+    /// loop, the second is grace under terms already agreed.
+    pub fn has_entitlement_record(&self, handle: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM holder_entitlements WHERE holder_handle = ?1)",
+                [handle],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count == 1)
+            .map_err(Into::into)
+    }
+
+    /// Discard entitlement records past the declared window.
+    ///
+    /// `metadataRetention.entitlementRecords` declares "to expiry plus
+    /// one revocation-epoch interval", and the caller computes that
+    /// floor. The epoch interval is in there because an entitlement
+    /// revoked just before it expired must stay recognisable for at
+    /// least as long as it takes the next epoch to say so.
+    pub fn sweep_entitlements(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM holder_entitlements WHERE julianday(expires_at) < julianday(?1)",
+            [older_than],
+        )?)
+    }
+
+    /// Holders with at least one live snapshot.
+    ///
+    /// The sweep's starting point for post-grace expiry. Deriving lapse
+    /// from here rather than from `lapse_state` alone is deliberate: a
+    /// holder who stopped paying and never came back never triggers a
+    /// request-time evaluation, and an operator that only expired the
+    /// holders who kept knocking would hold the abandoned ones forever.
+    pub fn holders_with_snapshots(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT holder_handle FROM snapshots
+             WHERE erased_at IS NULL AND retained_until IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
+    }
+
+
+
+
+    /// Persist the epoch in force, so a restart during a broker outage
+    /// comes back with the revocations it had rather than with none.
+    pub fn cache_epoch(&self, epoch: i64, fetched_at: &str, document: &[u8]) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO revocation_cache (epoch, fetched_at, document)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![epoch, fetched_at, document],
+        )?;
+        // Only the newest is useful; older epochs are a list of
+        // revocations that have since been restated or expired.
+        self.connection.execute(
+            "DELETE FROM revocation_cache WHERE epoch < ?1",
+            [epoch],
+        )?;
+        Ok(())
+    }
+
+    /// The newest cached epoch, with when it was fetched.
+    pub fn latest_epoch(&self) -> Result<Option<(Vec<u8>, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT document, fetched_at FROM revocation_cache ORDER BY epoch DESC LIMIT 1",
+        )?;
+        let mut rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Record a terms document, if it is not already known.

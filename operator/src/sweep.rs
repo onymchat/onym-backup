@@ -30,6 +30,8 @@ use crate::blobs::Blobs;
 use crate::store::Store;
 
 pub struct Swept {
+    pub post_grace_snapshots: usize,
+    pub aged_entitlements: usize,
     pub expired_grants: usize,
     pub orphan_incoming: usize,
     pub orphan_snapshots: usize,
@@ -46,6 +48,10 @@ pub struct Cutoffs<'a> {
     pub outcome: &'a str,
     pub receipt: &'a str,
     pub erased_reference: &'a str,
+    /// Entitlement records past `expiry plus one revocation-epoch
+    /// interval`, which is what `metadataRetention.entitlementRecords`
+    /// declares.
+    pub entitlement: &'a str,
 }
 
 /// Runs at boot and then on a timer, on the blocking pool. Failures are
@@ -59,6 +65,8 @@ pub fn reconcile(
     store: &Mutex<Store>,
     blob_mutations: &Mutex<()>,
     blobs: &Blobs,
+    revoked: &HashSet<String>,
+    now_at: time::OffsetDateTime,
     cutoffs: Cutoffs<'_>,
 ) -> Swept {
     let Cutoffs {
@@ -67,8 +75,11 @@ pub fn reconcile(
         outcome: outcome_floor,
         receipt: receipt_floor,
         erased_reference: erased_floor,
+        entitlement: entitlement_floor,
     } = cutoffs;
     let mut swept = Swept {
+        post_grace_snapshots: 0,
+        aged_entitlements: 0,
         expired_grants: 0,
         orphan_incoming: 0,
         orphan_snapshots: 0,
@@ -78,6 +89,59 @@ pub fn reconcile(
         aged_receipts: 0,
         forgotten_references: 0,
     };
+
+    // (0) Snapshots whose own grace window closed.
+    //
+    // First, because marking one `retention_expired` drops it out of
+    // the live set and step (4) then collects its bytes as an orphan in
+    // the same pass — one deletion path rather than two.
+    //
+    // **Reported as retention expiry, not as erasure.** The holder did
+    // not erase it; its retention ran out, which is what the terms they
+    // accepted said would happen. No receipt is minted: §11 receipts
+    // answer a holder's erase request, and signing one nobody asked for
+    // would be evidence of a decision the holder did not make.
+    let holders = match store.blocking_lock().holders_with_snapshots() {
+        Ok(holders) => holders,
+        Err(error) => {
+            tracing::warn!(%error, "could not list holders");
+            Vec::new()
+        }
+    };
+    for handle in holders {
+        let due = match crate::lapse::post_grace_due(
+            &store.blocking_lock(),
+            &handle,
+            revoked,
+            now_at,
+        ) {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!(%error, "could not evaluate post-grace state");
+                continue;
+            }
+        };
+        for (digest, after_grace) in due {
+            // Only `erase` is implemented. A terms document declaring a
+            // cold state is promising something this operator does not
+            // do, and the safe reading of an unimplemented clause is to
+            // keep the bytes and say so — deleting on a clause we
+            // cannot honour would be the one irreversible way to be
+            // wrong about it.
+            if after_grace != "erase" {
+                tracing::warn!(
+                    %after_grace,
+                    "terms declare a post-grace state this operator does not implement; keeping the snapshot"
+                );
+                continue;
+            }
+            let _mutation = blob_mutations.blocking_lock();
+            match store.blocking_lock().mark_unavailable(&handle, &digest, now) {
+                Ok(changed) => swept.post_grace_snapshots += changed,
+                Err(error) => tracing::warn!(%error, "could not expire a post-grace snapshot"),
+            }
+        }
+    }
 
     // (1) Grants that ran out. The bytes go first: if the row survives
     // a crash here the next sweep finds it again, whereas a row deleted
@@ -163,6 +227,13 @@ pub fn reconcile(
             }
             Err(error) => tracing::warn!(%error, "could not inspect retained snapshot"),
         }
+    }
+
+    // (3b) Entitlement records past what `metadataRetention`
+    // declares. A window nothing enforces is a window in name only.
+    match store.blocking_lock().sweep_entitlements(entitlement_floor) {
+        Ok(count) => swept.aged_entitlements += count,
+        Err(error) => tracing::warn!(%error, "could not sweep entitlement records"),
     }
 
     // (4) Snapshot directories with no row — the crash-between-rename-
@@ -280,7 +351,19 @@ mod tests {
             outcome,
             receipt,
             erased_reference,
+            entitlement: "2000-01-01T00:00:00Z",
         }
+    }
+
+    /// These tests are about bytes and rows, not payment. A free
+    /// operator holds no entitlements, so an empty revoked set and a
+    /// fixed clock are the whole of what post-grace expiry needs to
+    /// find nothing to do.
+    fn unpaid() -> (HashSet<String>, time::OffsetDateTime) {
+        (
+            HashSet::new(),
+            time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        )
     }
 
     #[test]
@@ -302,6 +385,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-01T00:00:00Z",
                 "2026-01-01T00:00:00Z",
@@ -333,6 +418,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-02T00:00:00Z",
                 "2026-01-02T00:00:00Z",
@@ -360,6 +447,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-01T00:00:00Z",
                 "2026-01-01T00:00:00Z",
@@ -398,6 +487,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-01T00:00:00Z",
                 "2026-01-01T00:00:00Z",
@@ -425,6 +516,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-02T00:00:00Z",
                 "2000-01-01T00:00:00Z",
@@ -470,6 +563,8 @@ mod tests {
             &store,
             &Mutex::new(()),
             &blobs,
+            &unpaid().0,
+            unpaid().1,
             cutoffs(
                 "2026-01-01T12:00:00Z",
                 "2026-01-01T06:00:00Z",

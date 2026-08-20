@@ -192,14 +192,18 @@ pub async fn preflight(
         });
     }
 
-    // (3) Payment. Free operators never reach this.
-    if state.config.requires_entitlement() {
-        return Err(Error::PaymentRequired {
-            component_id: state.config.component_id.clone(),
-            offers: vec![],
-            entitlement_issuers: state.config.entitlement_issuers.clone(),
-        });
-    }
+    // (3) Payment. Free operators never reach this, and on a charging
+    // one this is where the payment loop starts: no entitlement is a
+    // `402` naming the offers, and the client retries the *same*
+    // operationId with the *same* bytes once it holds one (§10.2).
+    crate::lapse::require(
+        &state,
+        &store,
+        &holder,
+        &headers,
+        crate::lapse::Operation::Preflight,
+        now,
+    )?;
 
     // (4) Already held — before the bounds, deliberately.
     if store.snapshot_exists(&holder.handle, &reference.digest)? {
@@ -305,6 +309,14 @@ pub async fn put_chunk(
     let upload = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "PUT", &path, &body, &state.config, &store, now)?;
+        crate::lapse::require(
+            &state,
+            &store,
+            &holder,
+            &headers,
+            crate::lapse::Operation::Upload,
+            now,
+        )?;
         let upload = store
             .upload(&upload_id)?
             .ok_or(Error::NotFound(Resource::Upload))?;
@@ -364,6 +376,14 @@ pub async fn commit(
     let upload = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "POST", &path, &body, &state.config, &store, now)?;
+        crate::lapse::require(
+            &state,
+            &store,
+            &holder,
+            &headers,
+            crate::lapse::Operation::Commit,
+            now,
+        )?;
         let upload = store
             .upload(&upload_id)?
             .ok_or(Error::NotFound(Resource::Upload))?;
@@ -527,6 +547,14 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         &store,
         now,
     )?;
+    crate::lapse::require(
+        &state,
+        &store,
+        &holder,
+        &headers,
+        crate::lapse::Operation::List,
+        now,
+    )?;
 
     // Erased rows included, reported as `erased`. §5.7 makes that a
     // distinct status because a holder asking about a digest they
@@ -574,6 +602,17 @@ pub async fn download(
     let (holder, row) = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
+        // Downloading is one of the operations a terms document can
+        // promise back during grace, so this is not a plain
+        // entitled-or-not check — see the union in `lapse`.
+        crate::lapse::require(
+            &state,
+            &store,
+            &holder,
+            &headers,
+            crate::lapse::Operation::Download,
+            now,
+        )?;
         // Shape-checked as well as looked up. The database lookup would
         // refuse a malformed digest today because nothing matches it,
         // but the path segment reaches the filesystem and should not
@@ -660,6 +699,10 @@ pub mod tests {
     pub struct Harness {
         pub state: Arc<AppState>,
         pub signing: SigningKey,
+        /// A credential this holder is currently carrying, attached to
+        /// every request the way both shipped clients attach one.
+        /// `None` is a holder who has never paid.
+        pub entitlement: std::sync::Mutex<Option<String>>,
         _dir: tempfile::TempDir,
     }
 
@@ -684,8 +727,14 @@ pub mod tests {
                     .unwrap(),
                 ),
                 signing: SigningKey::from_bytes(&[5u8; 32]),
+                entitlement: std::sync::Mutex::new(None),
                 _dir: dir,
             }
+        }
+
+        /// Start carrying a credential, or stop.
+        pub fn holding(&self, credential: Option<String>) {
+            *self.entitlement.lock().unwrap() = credential;
         }
 
         /// The blinded handle the operator knows this holder by.
@@ -711,15 +760,17 @@ pub mod tests {
                     .to_bytes(),
             );
 
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method(method)
                 .uri(path)
                 .header(auth::HOLDER, reference)
                 .header(auth::TIMESTAMP, stamp)
                 .header(auth::NONCE, nonce)
-                .header(auth::SIGNATURE, signature)
-                .body(Body::from(body))
-                .unwrap();
+                .header(auth::SIGNATURE, signature);
+            if let Some(credential) = self.entitlement.lock().unwrap().as_ref() {
+                request = request.header(crate::entitlements::HEADER, credential);
+            }
+            let request = request.body(Body::from(body)).unwrap();
             let response = router(self.state.clone()).oneshot(request).await.unwrap();
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

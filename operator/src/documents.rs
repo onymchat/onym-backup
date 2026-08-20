@@ -202,7 +202,10 @@ fn manifest_document(config: &Config, operator_key: &str, terms_id: &str) -> Val
         // Empty in free mode, and that is the declaration: an operator
         // naming no issuers never asks for an entitlement.
         "entitlementIssuers": config.entitlement_issuers,
-        "offers": [],
+        // Ids only. A price here would be this operator asserting terms
+        // it is not party to (§10.1); what an offer costs belongs to
+        // the frontend's channel agreement.
+        "offers": config.offers,
     })
 }
 
@@ -253,6 +256,62 @@ fn iso_duration(seconds: i64) -> String {
     } else {
         format!("PT{seconds}S")
     }
+}
+
+/// Read a declared duration back into seconds.
+///
+/// The inverse of `iso_duration`, and deliberately the same reader the
+/// clients use — `BackupDuration.seconds` in onym-ios `BackupTerms.swift`
+/// and its Kotlin twin. Years and months are approximated at 365 and 30
+/// days, which is unfit for calendar arithmetic and exactly right for
+/// the one question asked of it: how long is this declared window. The
+/// alternative is refusing to compare `P1M` against `P30D` at all.
+///
+/// **This must not drift from the client's reader.** A grace window the
+/// operator computes as shorter than the client displays is the person
+/// being cut off while their screen still says they have time.
+pub fn duration_seconds(value: &str) -> Option<i64> {
+    // A declaration of nothing is a real, comparable window of length
+    // zero — the profile requires `accessLogs: "none"`, and reading it
+    // as unparseable would make "no log at all" look like a malformed
+    // document rather than the strongest possible answer.
+    if value == "none" {
+        return Some(0);
+    }
+    let rest = value.strip_prefix('P')?;
+    let mut total: i64 = 0;
+    let mut number = String::new();
+    let mut in_time = false;
+    let mut saw_unit = false;
+    for character in rest.chars() {
+        if character == 'T' {
+            in_time = true;
+            continue;
+        }
+        if character.is_ascii_digit() {
+            number.push(character);
+            continue;
+        }
+        let magnitude: i64 = number.parse().ok()?;
+        number.clear();
+        saw_unit = true;
+        let seconds = match (character, in_time) {
+            ('Y', false) => 365 * 86_400,
+            ('M', false) => 30 * 86_400,
+            ('W', false) => 7 * 86_400,
+            ('D', false) => 86_400,
+            ('H', true) => 3_600,
+            ('M', true) => 60,
+            ('S', true) => 1,
+            _ => return None,
+        };
+        total = total.checked_add(magnitude.checked_mul(seconds)?)?;
+    }
+    // A trailing number with no unit is malformed, not a silent zero.
+    if !number.is_empty() || !saw_unit {
+        return None;
+    }
+    Some(total)
 }
 
 fn default_terms(config: &Config, operator_key: &str) -> Value {

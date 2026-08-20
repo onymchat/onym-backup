@@ -78,6 +78,14 @@ pub async fn erase(
             &store,
             now,
         )?;
+        crate::lapse::require(
+            &state,
+            &store,
+            &holder,
+            &headers,
+            crate::lapse::Operation::Erase,
+            now,
+        )?;
         let request: EraseRequest = serde_json::from_slice(&body)
             .map_err(|e| Error::BadRequest(format!("erasure body: {e}")))?;
         if request.operation_id.trim().is_empty() {
@@ -757,11 +765,14 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
                     outcome: "2000-01-01T00:00:00Z",
                     receipt: "2000-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                     erased_reference: "2000-01-01T00:00:00Z",
                 },
             )
@@ -904,6 +915,8 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
@@ -911,6 +924,7 @@ mod tests {
                     // Every receipt is now past its window.
                     receipt: "2099-01-01T00:00:00Z",
                     erased_reference: "2000-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                 },
             )
         });
@@ -1097,11 +1111,14 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
                     outcome: "2099-01-01T00:00:00Z",
                     receipt: "2000-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                     erased_reference: "2000-01-01T00:00:00Z",
                 },
             )
@@ -1336,12 +1353,15 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
                     outcome: "2000-01-01T00:00:00Z",
                     receipt: "2099-01-01T00:00:00Z",
                     erased_reference: "2000-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                 },
             )
         });
@@ -1373,12 +1393,15 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
                     outcome: "2000-01-01T00:00:00Z",
                     receipt: "2099-01-01T00:00:00Z",
                     erased_reference: "2099-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                 },
             )
         });
@@ -1410,12 +1433,15 @@ mod tests {
                 &harness.state.store,
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
+                &std::collections::HashSet::new(),
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
                     nonce: "2000-01-01T00:00:00Z",
                     outcome: "2000-01-01T00:00:00Z",
                     receipt: "2099-01-01T00:00:00Z",
                     erased_reference: "2000-01-01T00:00:00Z",
+                    entitlement: "2000-01-01T00:00:00Z",
                 },
             )
         });
