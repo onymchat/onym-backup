@@ -12,6 +12,8 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
@@ -42,6 +44,11 @@ pub fn signing_bytes(
 }
 
 fn append(out: &mut Vec<u8>, field: &[u8]) {
+    // Unreachable with any real field — the longest is a path — but a
+    // silent truncation here would collapse two different requests onto
+    // one signing payload, which is the failure the prefixes exist to
+    // prevent.
+    debug_assert!(field.len() <= u32::MAX as usize, "signed field too long to length-prefix");
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
 }
@@ -76,6 +83,30 @@ pub fn holder_handle(key: &VerifyingKey) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// A proof that verified, and what the caller still owes.
+///
+/// Returned rather than a bare key so the nonce is in the caller's
+/// hands: §8.2 requires it to be single-use, and single-use is not
+/// something this function can enforce — it has no store. Handing back
+/// a `VerifyingKey` alone made `verify` look complete, and a route
+/// could have shipped calling it and nothing else.
+#[must_use = "the nonce must be recorded single-use before the request is honoured"]
+pub struct VerifiedProof {
+    pub key: VerifyingKey,
+    /// Record this and refuse a repeat. Retain for at least **twice**
+    /// the freshness window: the window is two-sided, so a signature
+    /// timestamped `max_skew` ahead stays acceptable until `now +
+    /// max_skew` and is live for up to `2 × max_skew` from first sight.
+    pub nonce: String,
+    pub handle: String,
+}
+
+/// Verify a request's signature and its freshness.
+///
+/// Freshness is checked here because it needs only a clock. Replay is
+/// not, because it needs a store — see `VerifiedProof::nonce`. The
+/// split is deliberate and the type makes it visible rather than
+/// leaving it to a comment nobody reads at the call site.
 pub fn verify(
     holder: &str,
     signature_b64: &str,
@@ -84,8 +115,18 @@ pub fn verify(
     timestamp: &str,
     nonce: &str,
     body: &[u8],
-) -> Result<VerifyingKey> {
+    now: OffsetDateTime,
+    max_skew_secs: i64,
+) -> Result<VerifiedProof> {
     use base64::Engine;
+
+    let signed_at = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .map_err(|_| Error::SignatureInvalid)?;
+    // Two-sided: a client clock running fast is ordinary, and refusing
+    // every such request would refuse most of them.
+    if (now - signed_at).whole_seconds().abs() > max_skew_secs {
+        return Err(Error::SignatureInvalid);
+    }
 
     let key = holder_key(holder)?;
     let signature = base64::engine::general_purpose::STANDARD
@@ -97,7 +138,11 @@ pub fn verify(
     let bytes = signing_bytes(method, path, holder, timestamp, nonce, body);
     key.verify(&bytes, &Signature::from_bytes(&signature))
         .map_err(|_| Error::SignatureInvalid)?;
-    Ok(key)
+    Ok(VerifiedProof {
+        handle: holder_handle(&key),
+        key,
+        nonce: nonce.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -122,25 +167,81 @@ mod tests {
             &base64::engine::general_purpose::STANDARD,
             signing.sign(&bytes).to_bytes(),
         );
-        assert!(verify(
-            &holder, &signature, "PUT", "/v1/snapshots", "2026-08-20T10:00:00Z", "ab", b"x"
+        let now = OffsetDateTime::parse("2026-08-20T10:00:00Z", &Rfc3339).unwrap();
+        let proof = verify(
+            &holder, &signature, "PUT", "/v1/snapshots", "2026-08-20T10:00:00Z", "ab", b"x", now,
+            300,
         )
-        .is_ok());
+        .expect("a fresh, correctly signed request was refused");
+        // The nonce comes back because recording it single-use is the
+        // caller's job; the handle, not the key, is what gets stored.
+        assert_eq!(proof.nonce, "ab");
+        assert_eq!(proof.handle, holder_handle(&signing.verifying_key()));
     }
 
-    /// The property the length prefixes exist for: a signature over one
-    /// request must not verify against another whose fields concatenate
-    /// to the same bytes.
+    /// The property the length prefixes exist for.
+    ///
+    /// The previous version of this test did not test it. It tried to
+    /// shift a byte between `path` and `timestamp`, which are *not*
+    /// adjacent — the fixed 78-byte holder sits between them — so both
+    /// concatenations differed regardless of framing, and the
+    /// assertions still passed with the prefixes removed.
+    ///
+    /// `timestamp` and `nonce` are adjacent and both attacker-supplied,
+    /// so these two inputs concatenate to the identical byte string.
+    /// Only the length prefixes separate them: strip `append`'s prefix
+    /// and this assertion fires.
     #[test]
-    fn field_boundaries_cannot_shift() {
+    fn adjacent_field_boundaries_cannot_shift() {
         let holder = "onym:seat-key:".to_string() + &"a".repeat(64);
-        let a = signing_bytes("PUT", "/v1/uploads/u1/chunks/1", &holder, "t", "n", b"");
-        let b = signing_bytes("PUT", "/v1/uploads/u1/chunks/11", &holder, "t", "n", b"");
-        assert_ne!(a, b);
+        let a = signing_bytes("PUT", "/x", &holder, "ab", "cd", b"");
+        let b = signing_bytes("PUT", "/x", &holder, "abc", "d", b"");
 
-        let c = signing_bytes("PUT", "/v1/uploads/u/chunks/0", &holder, "t", "n", b"");
-        let d = signing_bytes("PUT", "/v1/uploads/u/chunks/", &holder, "0t", "n", b"");
-        assert_ne!(c, d, "a boundary shift produced identical signing bytes");
+        // The naive concatenation is the same for both — which is the
+        // whole point, and is asserted rather than assumed.
+        let naive = |t: &str, n: &str| format!("onym-backup-v1PUT/x{holder}{t}{n}").into_bytes();
+        assert_eq!(naive("ab", "cd"), naive("abc", "d"));
+
+        assert_ne!(a, b, "a boundary shift produced identical signing bytes");
+    }
+
+    /// Freshness is checked; replay is the caller's to record.
+    #[test]
+    fn stale_and_future_timestamps_are_refused() {
+        use ed25519_dalek::Signer;
+        let signing = key();
+        let holder = holder_of(&signing);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+
+        let sign_at = |stamp: &str| {
+            let bytes = signing_bytes("GET", "/v1/snapshots", &holder, stamp, "n", b"");
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                signing.sign(&bytes).to_bytes(),
+            )
+        };
+        let at = |offset: i64| {
+            (now + time::Duration::seconds(offset))
+                .format(&Rfc3339)
+                .unwrap()
+        };
+
+        for offset in [0i64, 299, -299] {
+            let stamp = at(offset);
+            assert!(
+                verify(&holder, &sign_at(&stamp), "GET", "/v1/snapshots", &stamp, "n", b"", now, 300)
+                    .is_ok(),
+                "a signature {offset}s from now was refused"
+            );
+        }
+        for offset in [301i64, -301] {
+            let stamp = at(offset);
+            assert!(
+                verify(&holder, &sign_at(&stamp), "GET", "/v1/snapshots", &stamp, "n", b"", now, 300)
+                    .is_err(),
+                "a signature {offset}s from now was accepted"
+            );
+        }
     }
 
     /// A body-less request and an empty-body request sign the same

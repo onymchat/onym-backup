@@ -11,8 +11,30 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+/// What a 404 is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    Snapshot,
+    Upload,
+    Operation,
+}
+
+impl std::fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Resource::Snapshot => "snapshot",
+            Resource::Upload => "upload",
+            Resource::Operation => "operation",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// **This text reaches the client.** Unlike `Internal`, a
+    /// `BadRequest` message is echoed verbatim, so callers must keep it
+    /// holder-safe: a field name and what was wrong with it, never a
+    /// path, a query, or another holder's data.
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -59,14 +81,24 @@ pub enum Error {
     #[error("digest mismatch")]
     DigestMismatch,
 
-    #[error("not found")]
-    NotFound,
+    /// Names what was not found. The §9 routes 404 for uploads and
+    /// operations as well as snapshots, and a client branching on
+    /// `snapshot_not_found` would misread those — worth typing before
+    /// the vocabulary is depended on rather than after.
+    #[error("{0} not found")]
+    NotFound(Resource),
 
     /// Held once; no longer held.
     #[error("retention expired")]
     RetentionExpired,
 
-    #[error("internal error")]
+    /// `{0}` matters: without it `thiserror` generates a `Display` that
+    /// discards the payload, and the log below — which formats with
+    /// `%self` — records the literal "internal error" for every
+    /// failure. That is the one class where the text is the whole
+    /// value: a stringified `rusqlite::Error` naming a constraint, a
+    /// path, a filename. It is logged here and never returned.
+    #[error("internal error: {0}")]
     Internal(String),
 }
 
@@ -83,7 +115,9 @@ impl Error {
             Error::QuotaExceeded { .. } => "quota_exceeded",
             Error::ChunkMismatch => "chunk_mismatch",
             Error::DigestMismatch => "digest_mismatch",
-            Error::NotFound => "snapshot_not_found",
+            Error::NotFound(Resource::Snapshot) => "snapshot_not_found",
+            Error::NotFound(Resource::Upload) => "upload_not_found",
+            Error::NotFound(Resource::Operation) => "operation_not_found",
             Error::RetentionExpired => "retention_expired",
             Error::Internal(_) => "internal_error",
         }
@@ -99,7 +133,7 @@ impl Error {
             | Error::DigestMismatch => StatusCode::CONFLICT,
             Error::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::SnapshotTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Error::NotFound => StatusCode::NOT_FOUND,
+            Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::RetentionExpired => StatusCode::GONE,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

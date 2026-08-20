@@ -52,7 +52,5 @@ async fn main() {
         "onym-backup-operator starting"
     );
 
-    // Routes land in the next commit; this boots, validates, and says
-    // what it is.
-    let _ = config;
+    // Routes land next; this boots, validates, and says what it is.
 }

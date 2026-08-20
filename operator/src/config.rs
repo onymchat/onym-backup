@@ -83,12 +83,23 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
+        // Validated exactly as `issuer_keys` will parse it — prefix,
+        // length, lowercase-hex charset, and a real curve point.
+        //
+        // Checking less was worse than not checking: a typo'd issuer
+        // passed boot, `issuer_keys` then dropped it silently, and the
+        // operator came up in paid mode with an empty trust map. Every
+        // broker signature would be refused with nothing at boot having
+        // said why — which is precisely what this module's
+        // fail-at-boot posture exists to prevent.
+        //
+        // Lowercase is required for the same reason `payload::holder_key`
+        // requires it: a `SeatEntitlement`'s issuer is compared exactly,
+        // and a non-canonical spelling of the same key would never match.
         for issuer in &entitlement_issuers {
-            if !issuer.starts_with("onym:key:") || issuer.len() != "onym:key:".len() + 64 {
-                return Err(format!(
-                    "BACKUP_ENTITLEMENT_ISSUERS entry is not onym:key:<64 hex>: {issuer}"
-                ));
-            }
+            issuer_key(issuer).map_err(|reason| {
+                format!("BACKUP_ENTITLEMENT_ISSUERS entry {issuer}: {reason}")
+            })?;
         }
 
         let revocation_url = env::var("BACKUP_REVOCATION_URL").ok().filter(|v| !v.is_empty());
@@ -114,16 +125,23 @@ impl Config {
             signing_seed,
             entitlement_issuers,
             revocation_url,
-            revocation_poll_secs: parse_u64("BACKUP_REVOCATION_POLL_SECS", 900)?,
-            maximum_sealed_snapshot_bytes: parse_i64(
+            // All positive. A zero poll interval is a busy loop, a zero
+            // chunk size is an upload that never advances, and a
+            // negative maximum is a limit that refuses everything — none
+            // of them is a configuration someone meant.
+            revocation_poll_secs: parse_positive_u64("BACKUP_REVOCATION_POLL_SECS", 900)?,
+            maximum_sealed_snapshot_bytes: parse_positive_i64(
                 "BACKUP_MAX_SNAPSHOT_BYTES",
                 2 * 1024 * 1024 * 1024,
             )?,
-            maximum_retained_snapshots: parse_i64("BACKUP_MAX_SNAPSHOTS", 3)?,
-            chunk_bytes: parse_i64("BACKUP_CHUNK_BYTES", 8 * 1024 * 1024)?,
-            upload_expiry_secs: parse_i64("BACKUP_UPLOAD_EXPIRY_SECS", 24 * 3600)?,
-            max_skew_secs: parse_i64("BACKUP_MAX_SKEW_SECS", 300)?,
-            outcome_retention_secs: parse_i64("BACKUP_OUTCOME_RETENTION_SECS", 6 * 3600)?,
+            maximum_retained_snapshots: parse_positive_i64("BACKUP_MAX_SNAPSHOTS", 3)?,
+            chunk_bytes: parse_positive_i64("BACKUP_CHUNK_BYTES", 8 * 1024 * 1024)?,
+            upload_expiry_secs: parse_positive_i64("BACKUP_UPLOAD_EXPIRY_SECS", 24 * 3600)?,
+            max_skew_secs: parse_positive_i64("BACKUP_MAX_SKEW_SECS", 300)?,
+            outcome_retention_secs: parse_positive_i64(
+                "BACKUP_OUTCOME_RETENTION_SECS",
+                6 * 3600,
+            )?,
         })
     }
 
@@ -168,41 +186,73 @@ fn parse_seed(hex_value: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
-fn parse_i64(key: &str, default: i64) -> Result<i64, String> {
-    match env::var(key) {
-        Err(_) => Ok(default),
+fn parse_positive_i64(key: &str, default: i64) -> Result<i64, String> {
+    let value: i64 = match env::var(key) {
+        Err(_) => return Ok(default),
         Ok(value) => value
             .trim()
             .parse()
-            .map_err(|_| format!("{key} must be an integer")),
+            .map_err(|_| format!("{key} must be an integer"))?,
+    };
+    if value <= 0 {
+        return Err(format!("{key} must be greater than zero"));
     }
+    Ok(value)
 }
 
-fn parse_u64(key: &str, default: u64) -> Result<u64, String> {
-    match env::var(key) {
-        Err(_) => Ok(default),
+fn parse_positive_u64(key: &str, default: u64) -> Result<u64, String> {
+    let value: u64 = match env::var(key) {
+        Err(_) => return Ok(default),
         Ok(value) => value
             .trim()
             .parse()
-            .map_err(|_| format!("{key} must be an integer")),
+            .map_err(|_| format!("{key} must be an integer"))?,
+    };
+    if value == 0 {
+        return Err(format!("{key} must be greater than zero"));
     }
+    Ok(value)
+}
+
+/// One `onym:key:<64 lowercase hex>` reference, parsed strictly.
+///
+/// The single place the rule lives, so boot validation and the trust
+/// map can never drift apart — which is the bug this replaced.
+pub fn issuer_key(reference: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
+    let hex_value = reference
+        .strip_prefix("onym:key:")
+        .ok_or_else(|| "must start with onym:key:".to_string())?;
+    if hex_value.len() != 64 {
+        return Err("key must be 64 hex characters".into());
+    }
+    if !hex_value
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("key must be lowercase hex".into());
+    }
+    let bytes = hex::decode(hex_value).map_err(|_| "key is not hex".to_string())?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| "key must be 32 bytes".to_string())?;
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| "key is not a valid Ed25519 point".to_string())
 }
 
 /// Parsed `onym:key:<hex>` references, for verifying entitlements.
 pub fn issuer_keys(references: &[String]) -> BTreeMap<String, ed25519_dalek::VerifyingKey> {
+    // Every reference here has already passed `issuer_key` at boot, so
+    // a failure would mean the two disagreed — which is exactly the bug
+    // that made this silent-drop loop dangerous. It cannot happen now,
+    // and if it ever does the entry is dropped loudly rather than
+    // quietly.
     let mut keys = BTreeMap::new();
     for reference in references {
-        let Some(hex_value) = reference.strip_prefix("onym:key:") else {
-            continue;
-        };
-        let Ok(bytes) = hex::decode(hex_value) else {
-            continue;
-        };
-        let Ok(bytes): std::result::Result<[u8; 32], _> = bytes.try_into() else {
-            continue;
-        };
-        if let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&bytes) {
-            keys.insert(reference.clone(), key);
+        match issuer_key(reference) {
+            Ok(key) => {
+                keys.insert(reference.clone(), key);
+            }
+            Err(reason) => {
+                tracing::error!(%reference, %reason, "configured issuer failed to parse after boot validation");
+            }
         }
     }
     keys
