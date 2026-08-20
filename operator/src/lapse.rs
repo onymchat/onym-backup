@@ -45,12 +45,20 @@ use crate::store::Store;
 /// Every §9 operation, and the only place their lapse behaviour is
 /// written down.
 ///
-/// `Export` is never constructed outside the tests below, and that is
-/// the design rather than an oversight: §9.7 requires the export path
-/// to be one that never *consults* entitlement state, not one that
-/// consults it and allows — and a test scans that module for payment
-/// symbols to hold it there. The variant exists so this table can state
-/// export's answer alongside every other route's.
+/// `Export`, `Upload` and `Commit` are never constructed outside the
+/// tests below, and that is the design rather than an oversight.
+///
+/// §9.7 requires the export path to be one that never *consults*
+/// entitlement state, not one that consults it and allows — and a test
+/// scans that module for payment symbols to hold it there. §9.2 puts
+/// the chunk and commit routes in the same position for a different
+/// reason: what authorizes them is the grant, and consulting lapse
+/// there could only ever produce a refusal the profile forbids.
+///
+/// The variants exist so this table can state their answer alongside
+/// every other route's. A variant that says "never gated", for a
+/// reason, is a decision somebody can read; a route that simply stopped
+/// appearing here is one nobody can tell from an omission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Operation {
@@ -105,6 +113,25 @@ impl Operation {
             // response I lost". Refusing it would strand a holder
             // between two states rather than charge them for anything.
             Operation::Reconcile => true,
+            // Never gated — and this entry exists so that is a stated
+            // decision rather than a route that quietly stopped asking.
+            //
+            // §9.2: "A grant is an obligation the operator already
+            // accepted: the entitlement was checked when it was minted,
+            // and some of the bytes are already on the operator's
+            // disk... Finishing an upload the operator agreed to take
+            // is the smaller commitment." A holder whose seat lapses
+            // mid-upload would otherwise hold a grant they can neither
+            // finish nor abandon, consuming quota until it expires,
+            // while download, export and erase keep working around it.
+            //
+            // It cannot become a way to store snapshots unpaid: neither
+            // route can exist without a live grant, the grant's own
+            // `expiresAt` bounds it and is never extended, and
+            // `Preflight` — the only route that mints one — is gated.
+            // A lapsed holder finishes what was in flight and gets
+            // nothing further.
+            Operation::Upload | Operation::Commit => true,
             // Everything else is decided by the terms.
             _ => false,
         }
@@ -117,11 +144,16 @@ impl Operation {
     /// because a lapsed holder is not owed new retention by any
     /// snapshot's terms." Grace protects what is already stored; it
     /// does not buy room for more.
+    ///
+    /// Read against §9.2, that sentence bounds the *creation* of a
+    /// grant, not the use of one already issued: `Preflight` is the
+    /// only route that mints an `uploadId`, so gating it is what closes
+    /// the upload path holder-wide. `Upload` and `Commit` are
+    /// `always_available` above and never reach this table — the check
+    /// they carry is the grant itself, which the operator issued while
+    /// the holder was entitled and which expires on its own clock.
     fn refused_holder_wide(self) -> bool {
-        matches!(
-            self,
-            Operation::Preflight | Operation::Upload | Operation::Commit
-        )
+        matches!(self, Operation::Preflight)
     }
 }
 
@@ -339,6 +371,60 @@ pub fn post_grace_due(
     Ok(due)
 }
 
+/// How long an entitlement record must outlive its own `expiresAt`,
+/// and the cutoff `sweep_entitlements` deletes below.
+///
+/// This is the whole of finding: **the record is what lapse is derived
+/// from.** `evaluate` reads `expires_at` to decide whether a holder is
+/// in grace, and `post_grace_due` reads the same field to decide when
+/// the snapshot's own window has closed. A row swept at expiry plus the
+/// poll interval takes both derivations with it: the holder is
+/// classified `Unpaid` rather than `Grace` — closing the download and
+/// erase their terms promised for another six weeks — and
+/// `post_grace_due` returns empty forever, so the bytes are never
+/// expired at all. Deleting a record early is not a cheaper version of
+/// deleting it on time; it is deleting the evidence of an obligation
+/// while the obligation is still running.
+///
+/// So the floor is expiry, plus the longest `notice + grace` any terms
+/// document this operator has published declares, plus one
+/// revocation-epoch interval. The first term covers the derivation, the
+/// second covers a revocation landing just before expiry.
+///
+/// The longest across *all* published terms rather than the current
+/// ones, because a snapshot keeps the terms it was accepted under
+/// (§5.4): the document governing the oldest retained snapshot may
+/// promise a longer window than the one this operator publishes today,
+/// and it is that promise the record has to outlive.
+///
+/// One record class, not two. The alternative — sweeping on time and
+/// caching the derived lapse elsewhere — replaces a record §15 already
+/// declares with a per-holder payment flag that would need declaring
+/// too, and that can only ever disagree with the derivation it stands
+/// in for. Holding one row a while longer and saying so is the smaller
+/// claim.
+pub fn record_floor(
+    store: &Store,
+    revocation_poll_secs: i64,
+    now: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    let mut longest = 0i64;
+    for terms_id in store.published_terms_ids()? {
+        let Some(clause) = end_of_payment(store, &terms_id)? else {
+            continue;
+        };
+        // Unreadable or absent clauses contribute nothing rather than
+        // shortening the floor: `end_of_payment` has already said so
+        // out loud, and the failure mode of keeping a row too long is
+        // one an operator can declare.
+        longest = longest.max(clause.notice_secs.saturating_add(clause.grace_secs));
+    }
+    now.checked_sub(time::Duration::seconds(
+        longest.saturating_add(revocation_poll_secs),
+    ))
+    .ok_or_else(|| Error::Internal("entitlement record floor is out of range".into()))
+}
+
 /// The gate every §9 route passes through.
 ///
 /// One function, one table, so that adding a route means answering the
@@ -496,6 +582,97 @@ mod tests {
         );
     }
 
+    /// §9.2: a grant the operator issued while the holder was entitled
+    /// is finishable after the lapse — every remaining chunk and the
+    /// commit — because the entitlement was checked when it was minted
+    /// and some of the bytes are already on the operator's disk.
+    ///
+    /// The whole sequence, because the halves pass separately and the
+    /// bug lives between them: re-preflight resuming a grant proves
+    /// nothing about the routes that actually move the bytes.
+    #[tokio::test]
+    async fn a_lapse_mid_upload_still_lets_the_grant_finish() {
+        let (harness, _, credential) = holder_with_a_snapshot().await;
+
+        // Preflight while entitled. This is the check §9.2 says the
+        // grant carries forward.
+        harness.holding(Some(credential));
+        let terms = harness.terms_id();
+        let fresh: Vec<u8> = (100..120u8).collect();
+        let (status, body) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&fresh, &terms))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let grant: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        let chunk_bytes = grant["chunkBytes"].as_u64().unwrap() as usize;
+        let chunk_count = grant["chunkCount"].as_u64().unwrap() as usize;
+        assert!(chunk_count > 1, "the test needs chunks either side of the lapse");
+
+        let chunk = |index: usize| {
+            let start = index * chunk_bytes;
+            fresh[start..usize::min(start + chunk_bytes, fresh.len())].to_vec()
+        };
+        let (status, _) = harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/0"), chunk(0))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The seat lapses with the transfer half done.
+        harness.holding(None);
+        lapsed_days_ago(&harness, 1).await;
+
+        for index in 1..chunk_count {
+            let (status, body) = harness
+                .send(
+                    "PUT",
+                    &format!("/v1/uploads/{upload_id}/chunks/{index}"),
+                    chunk(index),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "chunk {index} was refused after the lapse: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let (status, body) = harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the operator took the bytes and then refused to finish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["outcome"]["status"], "retained");
+
+        // Readable, not merely recorded: a commit that reported success
+        // and left nothing fetchable would pass every assertion above.
+        let hex_digest = hex::encode(Sha256::digest(&fresh));
+        let (status, bytes) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, fresh);
+
+        // And nothing further is granted. The lapsed holder finished
+        // what was in flight; the next preflight reaches the payment
+        // check and stops there.
+        let another: Vec<u8> = (200..220u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&another, &terms))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "finishing a grant bought a new one"
+        );
+    }
+
     /// Past notice plus grace, the promises are over and the gated
     /// routes close.
     #[tokio::test]
@@ -595,17 +772,112 @@ mod tests {
         );
     }
 
+    /// The sweep must not delete the record its own next decision
+    /// depends on.
+    ///
+    /// Two passes against the real sweep, because the failure is
+    /// invisible in either one alone. `expires_at` is the moment the
+    /// holder lapsed — the grace window and the post-grace expiry are
+    /// both computed from it — so a record swept an hour after expiry
+    /// takes both with it: the download the terms promise for another
+    /// six weeks closes immediately, and nothing is ever expired
+    /// afterwards, which is the operator holding the bytes forever
+    /// while believing it tidied up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_record_outlives_the_grace_it_is_derived_from() {
+        let (harness, snapshot, _) = holder_with_a_snapshot().await;
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+
+        // The default poll interval, which is the only term of the
+        // floor that would be there if the record were not what lapse
+        // is read from.
+        let poll = crate::config::Config::for_tests("onym:component:test", vec![])
+            .revocation_poll_secs as i64;
+        let sweep_now = |harness: &Harness| {
+            let at = OffsetDateTime::now_utc();
+            tokio::task::block_in_place(|| {
+                let floor = record_floor(&harness.state.store.blocking_lock(), poll, at)
+                    .unwrap()
+                    .format(&Rfc3339)
+                    .unwrap();
+                crate::sweep::reconcile(
+                    &harness.state.store,
+                    &harness.state.blob_mutations,
+                    &harness.state.blobs,
+                    &HashSet::new(),
+                    at,
+                    crate::sweep::Cutoffs {
+                        now: &at.format(&Rfc3339).unwrap(),
+                        nonce: "2000-01-01T00:00:00Z",
+                        outcome: "2000-01-01T00:00:00Z",
+                        receipt: "2000-01-01T00:00:00Z",
+                        erased_reference: "2000-01-01T00:00:00Z",
+                        entitlement: &floor,
+                    },
+                )
+            })
+        };
+
+        // (1) An hour past expiry — the point at which the first sweep
+        // after a lapse runs. The record must survive it.
+        lapsed_days_ago(&harness, 1).await;
+        let swept = sweep_now(&harness);
+        assert_eq!(swept.aged_entitlements, 0, "the record lapse is derived from was swept mid-grace");
+        assert_eq!(swept.post_grace_snapshots, 0);
+
+        // Which is the same thing as saying grace still works: the
+        // holder is in `Grace`, not `Unpaid`, and downloads what their
+        // terms promised.
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the sweep ended a grace window 43 days early");
+
+        // (2) Past notice plus grace. Now the window really is over,
+        // and the snapshot is expired *from that same record* — the
+        // half that goes silent rather than loud when the record is
+        // gone, because an empty `post_grace_due` looks exactly like
+        // nothing being due.
+        lapsed_days_ago(&harness, 50).await;
+        let swept = sweep_now(&harness);
+        assert_eq!(swept.post_grace_snapshots, 1, "the post-grace expiry never fired");
+
+        let (_, body) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows[0]["status"], json!("retention_expired"));
+
+        assert!(
+            !harness
+                .state
+                .blobs
+                .retained_on_disk()
+                .into_iter()
+                .any(|(_, digest)| digest == hex_digest),
+            "the bytes outlived the retention that justified holding them"
+        );
+
+        // And only now, in the pass that acted on it, does the record
+        // itself go — 50 days is past 44 plus a poll interval.
+        assert_eq!(swept.aged_entitlements, 1, "the record was kept past every window it could open");
+    }
+
     /// The two rules that are easy to get backwards, asserted directly
     /// on the table rather than through a router.
     #[test]
     fn the_allowlist_says_what_ten_three_says() {
         // Export is never gated. Not "gated and allowed" — never asked.
         assert!(Operation::Export.always_available());
-        // A lapsed holder is not owed new retention by any snapshot's
-        // terms, so grace does not reopen the upload path.
-        for operation in [Operation::Preflight, Operation::Upload, Operation::Commit] {
-            assert!(operation.refused_holder_wide());
-            assert!(!operation.always_available());
+        // A lapsed holder is not owed *new* retention by any snapshot's
+        // terms, so grace does not reopen the route that mints a grant.
+        assert!(Operation::Preflight.refused_holder_wide());
+        assert!(!Operation::Preflight.always_available());
+        // But finishing a grant the operator already issued is not new
+        // retention — §9.2 — so the two routes that can only run
+        // against a live grant are never gated at all. Not gated and
+        // refused, not gated and allowed: never asked.
+        for operation in [Operation::Upload, Operation::Commit] {
+            assert!(operation.always_available());
+            assert!(!operation.refused_holder_wide());
         }
         // These are the ones a terms document can promise back.
         assert_eq!(Operation::Download.grace_term(), Some("download"));

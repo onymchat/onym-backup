@@ -309,14 +309,15 @@ pub async fn put_chunk(
     let upload = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "PUT", &path, &body, &state.config, &store, now)?;
-        crate::lapse::require(
-            &state,
-            &store,
-            &holder,
-            &headers,
-            crate::lapse::Operation::Upload,
-            now,
-        )?;
+        // No payment gate here, deliberately — see
+        // `lapse::Operation::always_available`. §9.2: a grant is an
+        // obligation the operator already accepted, the entitlement was
+        // checked when it was minted, and some of these bytes are
+        // already on its disk. Gating the chunk route would leave a
+        // holder whose seat lapsed mid-upload holding a grant they can
+        // neither finish nor abandon, consuming quota until it expires.
+        // The grant's own `expiresAt` is what bounds this, and it is
+        // never extended.
         let upload = store
             .upload(&upload_id)?
             .ok_or(Error::NotFound(Resource::Upload))?;
@@ -376,14 +377,13 @@ pub async fn commit(
     let upload = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "POST", &path, &body, &state.config, &store, now)?;
-        crate::lapse::require(
-            &state,
-            &store,
-            &holder,
-            &headers,
-            crate::lapse::Operation::Commit,
-            now,
-        )?;
+        // Ungated for the same reason as the chunk route above, and
+        // more so: refusing the commit is the one refusal that wastes
+        // everything: every byte is already on disk and the only thing
+        // left is the bookkeeping that makes them retrievable. A holder
+        // refused here would have paid the whole transfer for a grant
+        // that expires into an orphan. Finishing an upload the operator
+        // agreed to take is the smaller commitment (§9.2).
         let upload = store
             .upload(&upload_id)?
             .ok_or(Error::NotFound(Resource::Upload))?;

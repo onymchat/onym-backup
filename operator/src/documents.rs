@@ -364,7 +364,24 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             "holderIdentifiers": "while any snapshot, receipt, erased reference, or live grant is held",
             "operationOutcomes": iso_duration(config.outcome_retention_secs),
             "erasureReceipts": iso_duration(config.receipt_retention_secs),
-            "entitlementRecords": "to expiry plus one revocation-epoch interval",
+            // Longer than §15's table suggests, and deliberately: the
+            // record is what lapse is derived from. Its `expiresAt` is
+            // the moment the holder lapsed, and both the grace window
+            // above and the post-grace expiry are computed from it, so
+            // a record discarded at expiry plus a poll interval would
+            // end this document's own `notice` plus `grace` early and
+            // leave nothing to expire the snapshot from afterwards.
+            //
+            // §15's rule is that records are declared rather than
+            // wished away, and §18.24 checks the operator against its
+            // declaration rather than against the table, so the honest
+            // move is to say the window that is actually held. It is
+            // the longest published notice-and-grace because a snapshot
+            // keeps the terms it was accepted under, which may not be
+            // these.
+            "entitlementRecords":
+                "to expiry, plus the longest notice-and-grace this operator has published, \
+                 plus one revocation-epoch interval",
             // How long the grant *record* outlives `expiresAt` — not
             // how long a grant lives. The partial bytes are never kept
             // past `expiresAt`. This declares the sweep interval

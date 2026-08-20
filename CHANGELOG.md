@@ -73,11 +73,13 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   from a charge — this operator is not the seller and has no charge to
   fail. Each retained snapshot is governed by the `endOfPayment` clause
   of **its own** pinned terms, notice then grace; what stays open is the
-  **union** of `duringGrace` across snapshots still in one. `preflight`,
-  upload and commit refuse holder-wide, because a lapsed holder is not
-  owed new retention by any snapshot's terms. The allowlist is an
-  explicit table in `lapse`, not an emergent property of which routes
-  happen to check an entitlement.
+  **union** of `duringGrace` across snapshots still in one. `preflight`
+  refuses holder-wide, because a lapsed holder is not owed new retention
+  by any snapshot's terms — but a grant already issued stays finishable,
+  chunks and commit included (§9.2). The allowlist is an explicit table
+  in `lapse`, not an emergent property of which routes happen to check
+  an entitlement, and the two ungated routes are entries in it rather
+  than absences from it.
 - Past grace, the sweep expires a snapshot and its bytes go with it,
   reported as `retention_expired` rather than `erased`. The holder did
   not erase it, and **no receipt is minted** — a §11 receipt answers a
@@ -108,6 +110,34 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Fixed
 
+- **A lapse mid-upload stranded the grant it arrived in the middle of.**
+  Chunks and commit were gated on payment, so a holder whose seat lapsed
+  with bytes already on the operator's disk held a grant they could
+  neither finish nor abandon — it consumed quota until it expired, and
+  every byte already transferred was wasted. §9.2 is explicit that
+  finishing an upload the operator agreed to take is the smaller
+  commitment: the entitlement was checked when the grant was minted, and
+  the grant's own `expiresAt` bounds it and is never extended. Only
+  `preflight` — the route that mints one — refuses.
+- **The entitlement record was swept ~43 days before the grace it
+  opened.** Records were deleted at expiry plus one poll interval, but
+  that row's `expires_at` is the moment lapse is derived from: within an
+  hour of expiry the holder read as never having paid rather than as in
+  grace, closing the download and erase their terms promised for another
+  six weeks, and `post_grace_due` then returned empty forever, so the
+  snapshot was never expired and the bytes were held indefinitely. The
+  record now survives until expiry plus the longest notice-and-grace
+  this operator has published plus one revocation-epoch interval — the
+  point at which every window it could open has closed and the sweep has
+  acted on it — and `metadataRetention.entitlementRecords` declares
+  exactly that, so §18.24 checks the operator against what it holds.
+- **`expiresAt` was exclusive.** A credential was refused at the exact
+  instant it expired, where §10.4 specifies `notBefore <= now <=
+  expiresAt`. One instant, but the same field starts the lapse clock, so
+  the operator was beginning notice-and-grace a tick before the
+  credential ran out. The onym-ios client is stricter by that instant in
+  the safe direction — it declines to use a credential this operator
+  would still accept.
 - Retention windows that cannot be represented are refused at boot instead of
   panicking the hourly sweep, and RFC 3339 values are compared as timestamps
   rather than strings.

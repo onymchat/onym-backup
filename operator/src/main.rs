@@ -216,12 +216,14 @@ async fn main() {
         let outcome_window = state.config.outcome_retention_secs;
         let receipt_window = state.config.receipt_retention_secs;
         let erased_window = state.config.erased_reference_retention_secs;
-        // "to expiry plus one revocation-epoch interval" — the
-        // declaration in `metadataRetention.entitlementRecords`, and the
-        // interval is in there because an entitlement revoked just
-        // before it expired must stay recognisable at least as long as
-        // it takes the next epoch to say so.
-        let entitlement_window = state.config.revocation_poll_secs as i64;
+        // The entitlement floor is not a constant, so it is computed
+        // per sweep by `lapse::record_floor` from the terms this
+        // operator has published: expiry, plus the longest declared
+        // notice-and-grace, plus this interval. All three terms are in
+        // the `metadataRetention.entitlementRecords` declaration, and
+        // the reason for the middle one is that the record is what
+        // lapse is derived from — see `lapse::record_floor`.
+        let poll_interval = state.config.revocation_poll_secs as i64;
         tokio::spawn(async move {
             loop {
                 let state = state.clone();
@@ -230,6 +232,26 @@ async fn main() {
                         at.format(&time::format_description::well_known::Rfc3339)
                     };
                     let at = time::OffsetDateTime::now_utc();
+                    // Reads the published terms, so it needs the lock —
+                    // taken and released before `reconcile` takes it
+                    // again, the same short-burst discipline the sweep
+                    // itself follows.
+                    let entitlement_floor = match lapse::record_floor(
+                        &state.store.blocking_lock(),
+                        poll_interval,
+                        at,
+                    ) {
+                        Ok(floor) => floor,
+                        Err(error) => {
+                            // Skip the sweep rather than fall back to a
+                            // shorter floor: a guessed floor deletes the
+                            // records lapse is derived from, and one
+                            // missed hour of tidying is recoverable
+                            // where that is not.
+                            tracing::warn!(%error, "could not compute the entitlement record floor");
+                            return None;
+                        }
+                    };
                     // Twice the skew window: it is two-sided, so a
                     // signature stamped `max_skew` ahead stays
                     // acceptable until `now + max_skew` and is live for
@@ -242,15 +264,13 @@ async fn main() {
                         let outcomes = at.checked_sub(time::Duration::seconds(outcome_window))?;
                         let receipts = at.checked_sub(time::Duration::seconds(receipt_window))?;
                         let erased = at.checked_sub(time::Duration::seconds(erased_window))?;
-                        let entitlements =
-                            at.checked_sub(time::Duration::seconds(entitlement_window))?;
                         Some((
                             stamp(at).ok()?,
                             stamp(floor).ok()?,
                             stamp(outcomes).ok()?,
                             stamp(receipts).ok()?,
                             stamp(erased).ok()?,
-                            stamp(entitlements).ok()?,
+                            stamp(entitlement_floor).ok()?,
                         ))
                     })();
                     stamped.map(|(now, floor, outcomes, receipts, erased, entitlements)| {

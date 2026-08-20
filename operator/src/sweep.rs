@@ -231,6 +231,15 @@ pub fn reconcile(
 
     // (3b) Entitlement records past what `metadataRetention`
     // declares. A window nothing enforces is a window in name only.
+    //
+    // **After step (0), and that ordering is load-bearing.** The record
+    // is what step (0) derives lapse from, and the floor
+    // (`lapse::record_floor`) is the last grace window it can open plus
+    // one poll interval — so the pass that first finds a record old
+    // enough to delete is the pass that has just acted on it. Sweeping
+    // records first would, on that one pass, leave the snapshot whose
+    // window had closed with nothing left to expire it from, and it
+    // would be held forever.
     match store.blocking_lock().sweep_entitlements(entitlement_floor) {
         Ok(count) => swept.aged_entitlements += count,
         Err(error) => tracing::warn!(%error, "could not sweep entitlement records"),

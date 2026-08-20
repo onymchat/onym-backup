@@ -604,11 +604,26 @@ impl Store {
 
     /// Discard entitlement records past the declared window.
     ///
-    /// `metadataRetention.entitlementRecords` declares "to expiry plus
-    /// one revocation-epoch interval", and the caller computes that
-    /// floor. The epoch interval is in there because an entitlement
-    /// revoked just before it expired must stay recognisable for at
-    /// least as long as it takes the next epoch to say so.
+    /// The caller computes the floor — `lapse::record_floor` — and
+    /// `metadataRetention.entitlementRecords` declares exactly what it
+    /// computes: expiry, plus the longest notice-and-grace this
+    /// operator has ever published, plus one revocation-epoch interval.
+    ///
+    /// The epoch interval is in there because an entitlement revoked
+    /// just before it expired must stay recognisable for at least as
+    /// long as it takes the next epoch to say so. The notice-and-grace
+    /// term is in there because **this row is what lapse is derived
+    /// from**: `lapse::evaluate` and `lapse::post_grace_due` both read
+    /// `expires_at` as the moment the holder lapsed. Deleting it at
+    /// expiry plus the poll interval — an hour, in the default
+    /// configuration — would end a 44-day grace window on the first
+    /// sweep after expiry and, worse, leave `post_grace_due` with
+    /// nothing to derive from, so the snapshot would never be expired
+    /// and the operator would hold the bytes forever.
+    ///
+    /// Once the row goes, every window it could have opened is closed
+    /// and every action it could have triggered has been taken, which
+    /// is the condition a retention bound is supposed to express.
     pub fn sweep_entitlements(&self, older_than: &str) -> Result<usize> {
         Ok(self.connection.execute(
             "DELETE FROM holder_entitlements WHERE julianday(expires_at) < julianday(?1)",
@@ -673,6 +688,18 @@ impl Store {
             rusqlite::params![terms_id, raw, signature, now],
         )?;
         Ok(())
+    }
+
+    /// Every terms document this operator has ever published.
+    ///
+    /// Every one of them, not just the current pair: a snapshot pins
+    /// the terms it was accepted under, so an older document with a
+    /// longer `endOfPayment` still governs something on disk and still
+    /// bounds how long the records it is read against must be kept.
+    pub fn published_terms_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare("SELECT terms_id FROM terms_documents")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
     }
 
     /// A published terms document by id, with its detached signature.

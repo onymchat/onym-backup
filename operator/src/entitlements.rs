@@ -134,16 +134,26 @@ pub fn verify(
         return Err(refused());
     }
 
-    // (5) The window. Upper bound is strict, matching
-    // `SeatEntitlementVerifier.verify` — an entitlement is not valid at
-    // the instant it expires, and the two sides disagreeing about that
-    // instant is a bug nobody would find.
+    // (5) The window, and **both bounds are inclusive**: §10.4 says
+    // `notBefore <= now <= expiresAt`, so a credential is still valid
+    // at the instant it expires.
+    //
+    // The onym-ios client
+    // (`OnymBilling/SeatEntitlementVerifier.swift`, `guard now <
+    // entitlement.expiresAt`) is stricter by one instant. That
+    // direction is safe and is not a disagreement worth resolving here:
+    // the client declines to *use* a credential this operator would
+    // still accept, so it fails closed on the client side and simply
+    // renews a moment early. The inverse — the operator refusing what
+    // the client considers live — is the one that produces a `402` on
+    // a screen showing time remaining, and it is what this comparison
+    // must not do.
     let stamp = |key: &str| -> Result<OffsetDateTime> {
         OffsetDateTime::parse(&string(key)?, &Rfc3339).map_err(|_| refused())
     };
     let not_before = stamp("notBefore")?;
     let expires_at = stamp("expiresAt")?;
-    if now < not_before || now >= expires_at {
+    if now < not_before || now > expires_at {
         return Err(refused());
     }
 
@@ -425,6 +435,60 @@ mod tests {
             assert_eq!(error["error"], "invalid_entitlement", "{name}");
             assert_eq!(error["entitlementIssuers"][0], json!(issuer), "{name}");
         }
+    }
+
+    /// §10.4's window is `notBefore <= now <= expiresAt`, both ends
+    /// inclusive. Asserted at the exact instant rather than through the
+    /// router, because a boundary is not something a request timed by
+    /// `now_utc()` can land on.
+    ///
+    /// The instant matters: `expiresAt` is also what lapse is derived
+    /// from, so an operator that treated it as already expired would
+    /// start a holder's notice-and-grace clock one tick before the
+    /// credential they paid for actually ran out.
+    #[test]
+    fn a_credential_is_still_valid_at_the_instant_it_expires() {
+        let (signing, issuer) = broker();
+        let config = crate::config::Config::for_tests("onym:component:test", vec![issuer]);
+        let holder = SigningKey::from_bytes(&[5u8; 32]);
+        let subject = format!(
+            "onym:seat-key:{}",
+            hex::encode(holder.verifying_key().as_bytes())
+        );
+        let expires_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let stamp = |at: OffsetDateTime| json!(at.format(&Rfc3339).unwrap());
+        let raw = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            credential(
+                &signing,
+                json!({
+                    "notBefore": stamp(expires_at - time::Duration::days(30)),
+                    "expiresAt": stamp(expires_at),
+                }),
+            ),
+        )
+        .unwrap();
+        let revoked = HashSet::new();
+
+        // The lower bound, for the same reason and in the same breath.
+        let not_before = expires_at - time::Duration::days(30);
+        assert!(
+            verify(&raw, &config, &subject, &revoked, not_before).is_ok(),
+            "refused at notBefore, which §10.4 includes"
+        );
+        assert!(
+            verify(&raw, &config, &subject, &revoked, expires_at).is_ok(),
+            "refused at expiresAt, which §10.4 includes"
+        );
+        // And one second past it is over, or the bound is not a bound.
+        assert!(verify(
+            &raw,
+            &config,
+            &subject,
+            &revoked,
+            expires_at + time::Duration::seconds(1)
+        )
+        .is_err());
     }
 
     /// A mutated field breaks the signature — asserted separately
