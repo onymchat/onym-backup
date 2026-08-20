@@ -5,8 +5,22 @@ operator/target/
 target/
 .git/
 .github/
-# Publishing artifacts and the discovery signing seed. The seed must
-# never reach an image; the rest is output, not input.
+
+# Secrets. `COPY . .` uploads the context to whichever local or remote
+# BuildKit builder runs the build, and it is cached there — so a file
+# excluded from git is NOT thereby excluded from disclosure. Docker does
+# not read .gitignore, which means every secret-bearing pattern in it
+# has to be repeated here or it silently stops being secret at the
+# moment this repo becomes a build context.
+#
+# Mirrors .gitignore's `*.env` (its `!*.env.example` exception is
+# deliberately not mirrored: an example file is harmless in the context
+# and reproducing the negation is a way to get the pattern wrong).
+.env
+*.env
+*.seed
+deploy/discovery/provider.seed
+
+# Publishing artifacts and fetched manifests: output, not input.
 deploy/discovery/out/
 deploy/discovery/reviewed/
-*.seed
