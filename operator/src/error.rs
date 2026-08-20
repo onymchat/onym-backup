@@ -18,6 +18,7 @@ pub enum Resource {
     Upload,
     Operation,
     Terms,
+    Receipt,
 }
 
 impl std::fmt::Display for Resource {
@@ -27,6 +28,7 @@ impl std::fmt::Display for Resource {
             Resource::Upload => "upload",
             Resource::Operation => "operation",
             Resource::Terms => "terms",
+            Resource::Receipt => "receipt",
         })
     }
 }
@@ -73,6 +75,8 @@ pub enum Error {
         maximum_retained_snapshots: i64,
         retained_bytes: i64,
         limit_bytes: i64,
+        open_grants: i64,
+        open_grant_bytes: i64,
     },
 
     /// Commit arrived before every chunk did. The grant survives and
@@ -80,7 +84,13 @@ pub enum Error {
     /// cost one chunk, not the whole snapshot.
     #[error("upload incomplete")]
     UploadIncomplete {
-        missing_chunks: Vec<i64>,
+        /// Inclusive `[first, last]` index ranges, not indices. A 5 GiB
+        /// snapshot at 8 MiB chunks is 640 indices, and a client that
+        /// has sent nothing would receive all of them — which is the
+        /// pressure that makes an operator truncate, and a truncated
+        /// gap list cannot be acted on in one round trip. Ranges are
+        /// compact for the common case and complete in every case.
+        missing_chunks: Vec<(i64, i64)>,
         chunk_count: i64,
     },
 
@@ -109,6 +119,15 @@ pub enum Error {
     /// Held once; no longer held.
     #[error("retention expired")]
     RetentionExpired,
+
+    /// The scope was erased and its receipts have aged out.
+    ///
+    /// Distinct from `retention_expired`, which §14 maps to an abstract
+    /// state about a *snapshot*. A client reusing that mapping would
+    /// render "retained once, no longer held" to a holder asking about
+    /// an erasure they requested themselves.
+    #[error("receipt expired")]
+    ReceiptExpired,
 
     /// `{0}` matters: without it `thiserror` generates a `Display` that
     /// discards the payload, and the log below — which formats with
@@ -139,7 +158,9 @@ impl Error {
             Error::NotFound(Resource::Upload) => "upload_not_found",
             Error::NotFound(Resource::Operation) => "operation_not_found",
             Error::NotFound(Resource::Terms) => "terms_not_found",
+            Error::NotFound(Resource::Receipt) => "receipt_not_found",
             Error::RetentionExpired => "retention_expired",
+            Error::ReceiptExpired => "receipt_expired",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -157,7 +178,7 @@ impl Error {
             Error::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::SnapshotTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::RetentionExpired => StatusCode::GONE,
+            Error::RetentionExpired | Error::ReceiptExpired => StatusCode::GONE,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -191,22 +212,29 @@ impl Error {
                 maximum_retained_snapshots,
                 retained_bytes,
                 limit_bytes,
+                open_grants,
+                open_grant_bytes,
             } => json!({
                 "retainedSnapshots": retained_snapshots,
                 "maximumRetainedSnapshots": maximum_retained_snapshots,
                 "retainedBytes": retained_bytes,
                 "limitBytes": limit_bytes,
+                // Issued grants count against the limit (§9.2 step 6),
+                // so without this a client sees usage below the maximum
+                // and a 409 beside it, with nothing naming what
+                // consumed the headroom. The refusal has to be legible
+                // from the refusal.
+                "openGrants": open_grants,
+                "openGrantBytes": open_grant_bytes,
             }),
             Error::UploadIncomplete {
                 missing_chunks,
                 chunk_count,
             } => json!({
-                // Capped: a client that has sent nothing does not need
-                // every index enumerated back at it, and the count is
-                // what tells them the difference between "one chunk
-                // short" and "start again".
-                "missingChunks": missing_chunks.iter().take(64).collect::<Vec<_>>(),
-                "missingChunkCount": missing_chunks.len(),
+                "missingChunks": missing_chunks
+                    .iter()
+                    .map(|(first, last)| json!([first, last]))
+                    .collect::<Vec<_>>(),
                 "chunkCount": chunk_count,
             }),
             _ => json!({}),

@@ -120,6 +120,14 @@ fn write_json_string(text: &str, out: &mut Vec<u8>) {
 pub struct Documents {
     pub manifest: Vec<u8>,
     pub profile: Vec<u8>,
+    /// Detached Ed25519 over the **exact served bytes** of the
+    /// manifest — not over its canonical form. §4.1 says served bytes,
+    /// and the difference matters: the embedded `signature` covers the
+    /// canonical document minus itself, so a verifier checking the
+    /// detached one against canonical bytes would fail on a document
+    /// that is perfectly valid.
+    pub manifest_signature: String,
+    pub terms_signature: String,
     /// `(termsId, bytes)`. Only one set is minted here; historical terms
     /// are served from disk in a later slice, because they must outlive
     /// any single boot.
@@ -144,6 +152,8 @@ impl Documents {
         )?;
 
         Ok(Documents {
+            manifest_signature: detached(&manifest, signing),
+            terms_signature: detached(&terms, signing),
             manifest,
             profile: serde_json::to_vec(&profile_document())
                 .map_err(|e| Error::Internal(e.to_string()))?,
@@ -209,12 +219,42 @@ fn profile_document() -> Value {
     })
 }
 
+/// A detached signature over exactly these bytes.
+fn detached(bytes: &[u8], signing: &SigningKey) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(signing.sign(bytes).to_bytes())
+}
+
+/// Sign an erasure receipt over its canonical bytes.
+///
+/// Public because §11's receipt is minted per request rather than at
+/// boot, and it is signed by the same key that signs the manifest and
+/// the terms: a holder who can check one can check all three without
+/// learning a second key.
+pub fn sign_receipt(receipt: Value, signing: &SigningKey) -> Result<(Value, Vec<u8>)> {
+    let bytes = sign(receipt, signing, &["signature"])?;
+    let document = serde_json::from_slice(&bytes).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok((document, bytes))
+}
+
 /// The starting terms.
 ///
 /// Deliberately unflattering where the truth is unflattering:
 /// `accessLogs` is `none` because §15 forbids the table, `excluded`
 /// names what erasure cannot reach, and `afterGrace` says what actually
 /// happens rather than the comfortable answer.
+fn iso_duration(seconds: i64) -> String {
+    if seconds % (24 * 60 * 60) == 0 {
+        format!("P{}D", seconds / (24 * 60 * 60))
+    } else if seconds % (60 * 60) == 0 {
+        format!("PT{}H", seconds / (60 * 60))
+    } else if seconds % 60 == 0 {
+        format!("PT{}M", seconds / 60)
+    } else {
+        format!("PT{seconds}S")
+    }
+}
+
 fn default_terms(config: &Config, operator_key: &str) -> Value {
     json!({
         "termsVersion": 1,
@@ -250,10 +290,26 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
         "metadataRetention": {
             "accessLogs": "none",
             "sizeAndTiming": "while the snapshot is retained",
-            "holderIdentifiers": "while any snapshot or receipt is held",
-            "operationOutcomes": "PT6H",
-            "erasureReceipts": "P1Y",
+            "holderIdentifiers": "while any snapshot, receipt, erased reference, or live grant is held",
+            "operationOutcomes": iso_duration(config.outcome_retention_secs),
+            "erasureReceipts": iso_duration(config.receipt_retention_secs),
             "entitlementRecords": "to expiry plus one revocation-epoch interval",
+            // How long the grant *record* outlives `expiresAt` — not
+            // how long a grant lives. The partial bytes are never kept
+            // past `expiresAt`. This declares the sweep interval
+            // honestly rather than claiming PT0S: the record is
+            // collected on a timer, so it can answer `upload_expired`
+            // for up to that long before becoming
+            // `upload_not_found`. Declaring zero and then holding it
+            // for an hour would be the comfortable answer rather than
+            // the true one.
+            "uploadGrants": "PT1H",
+            // What is remembered about a snapshot after its bytes are
+            // gone: the reference and when it went. Something must
+            // outlive the bytes or an erasure is indistinguishable from
+            // a snapshot never stored — and it is bounded for the same
+            // reason it exists.
+            "erasedReferences": iso_duration(config.erased_reference_retention_secs),
         },
     })
 }
@@ -350,6 +406,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terms_declare_the_configured_retention_windows() {
+        let mut config = config();
+        config.outcome_retention_secs = 90;
+        config.receipt_retention_secs = 2 * 24 * 60 * 60;
+        config.erased_reference_retention_secs = 3601;
+        let signing = SigningKey::from_bytes(&config.signing_seed);
+        let documents = Documents::build(&config, &signing).unwrap();
+        let terms: Value = serde_json::from_slice(&documents.terms.1).unwrap();
+        let retention = &terms["metadataRetention"];
+
+        assert_eq!(retention["operationOutcomes"], "PT90S");
+        assert_eq!(retention["erasureReceipts"], "P2D");
+        assert_eq!(retention["erasedReferences"], "PT3601S");
+        assert_eq!(
+            retention["holderIdentifiers"],
+            "while any snapshot, receipt, erased reference, or live grant is held"
+        );
+    }
+
     /// Erasure must name what it does not reach. An empty exclusion is
     /// not generosity, it is a claim nobody can honour.
     #[test]
@@ -359,5 +435,42 @@ mod tests {
         let excluded = terms["erasure"]["excluded"].as_str().unwrap();
         assert!(!excluded.trim().is_empty());
         assert!(excluded.contains("other participants"));
+    }
+
+    /// §4.1: a detached signature over **the exact served bytes**.
+    ///
+    /// Not over canonical bytes. The embedded `signature` covers the
+    /// canonical document minus itself, so the two are different
+    /// signatures over different inputs — and a verifier handed the
+    /// detached one, checking it the way it would check the embedded
+    /// one, would reject a perfectly valid document.
+    #[test]
+    fn detached_signatures_cover_the_bytes_that_are_served() {
+        let (documents, signing) = documents();
+        let key = signing.verifying_key();
+
+        for (name, bytes, detached) in [
+            ("manifest", &documents.manifest, &documents.manifest_signature),
+            ("terms", &documents.terms.1, &documents.terms_signature),
+        ] {
+            let raw = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                detached,
+            )
+            .unwrap();
+            let signature = ed25519_dalek::Signature::from_slice(&raw).unwrap();
+            key.verify(bytes, &signature)
+                .unwrap_or_else(|_| panic!("{name}.sig does not cover the served bytes"));
+
+            // And it is genuinely a different signature from the
+            // embedded one, which is the thing that would otherwise go
+            // unnoticed.
+            let embedded: Value = serde_json::from_slice(bytes).unwrap();
+            assert_ne!(
+                embedded["signature"].as_str().unwrap(),
+                detached.as_str(),
+                "{name}.sig is the embedded signature, not a detached one"
+            );
+        }
     }
 }
