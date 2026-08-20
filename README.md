@@ -36,7 +36,17 @@ entitlement enforcement is a declared capability.
 
 ## Status
 
-Early. The crate boots, validates its configuration, and implements the
-proof-of-possession layer. The wire surface — preflight, chunked upload,
-list, download, erase, export — is being built against the profile's
-§9 route table.
+Early. It boots, signs and serves its manifest, profile and terms, and
+holds the bookkeeping schema. The `/v1/` surface — preflight, chunked
+upload, list, download, erase, export — is being built against the
+profile's §9 route table.
+
+```
+BACKUP_COMPONENT_ID=onym:component:you \
+BACKUP_PUBLIC_URL=https://backup.example \
+BACKUP_SIGNING_SEED=$(openssl rand -hex 32) \
+cargo run -p onym-backup-operator
+```
+
+With no `BACKUP_ENTITLEMENT_ISSUERS` that is a complete free-mode
+operator's configuration.
