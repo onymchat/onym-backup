@@ -23,7 +23,10 @@ mod auth;
 mod blobs;
 mod config;
 mod documents;
+mod erasures;
 mod error;
+mod export;
+mod operations;
 mod payload;
 mod store;
 mod sweep;
@@ -90,19 +93,36 @@ async fn main() {
         eprintln!("could not create {blob_root}: {error}");
         exit(1);
     }
-    let state = std::sync::Arc::new(api::AppState {
+    let now = match time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+    {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("could not stamp boot: {error}");
+            exit(1);
+        }
+    };
+    let state = match api::AppState::new(
         config,
         documents,
-        store: tokio::sync::Mutex::new(store),
-        blobs: blobs::Blobs::new(blob_root),
-    });
+        store,
+        blobs::Blobs::new(blob_root),
+        signing,
+        &now,
+    ) {
+        Ok(state) => std::sync::Arc::new(state),
+        Err(error) => {
+            eprintln!("could not assemble operator state: {error}");
+            exit(1);
+        }
+    };
 
     // Reconcile before serving, then hourly. Bytes and rows are
     // written in two steps, so a crash between them leaves one without
     // the other; this deletes bytes with no row and never invents a row
-    // for bytes it found. It also collects grants that expired — the
-    // only bound on `incoming/` that does not depend on clients
-    // finishing what they start — and spent replay nonces.
+    // for bytes it found. It also collects expired grants — the only
+    // bound on `incoming/` that does not depend on clients finishing
+    // what they start — spent replay nonces, and aged outcome records.
     //
     // On the blocking pool, not the runtime: it walks every holder and
     // digest under the blob root, and it takes the store lock in short
@@ -111,6 +131,7 @@ async fn main() {
     {
         let state = state.clone();
         let skew = state.config.max_skew_secs;
+        let outcome_window = state.config.outcome_retention_secs;
         tokio::spawn(async move {
             loop {
                 let state = state.clone();
@@ -126,10 +147,15 @@ async fn main() {
                     // drop it while still valid and reopen the replay
                     // the table closes.
                     let floor = at - time::Duration::seconds(skew * 2);
-                    match (stamp(at), stamp(floor)) {
-                        (Ok(now), Ok(floor)) => {
-                            Some(sweep::reconcile(&state.store, &state.blobs, &now, &floor))
-                        }
+                    let outcomes = at - time::Duration::seconds(outcome_window);
+                    match (stamp(at), stamp(floor), stamp(outcomes)) {
+                        (Ok(now), Ok(floor), Ok(outcomes)) => Some(sweep::reconcile(
+                            &state.store,
+                            &state.blobs,
+                            &now,
+                            &floor,
+                            &outcomes,
+                        )),
                         _ => None,
                     }
                 })
@@ -141,6 +167,7 @@ async fn main() {
                             + swept.orphan_incoming
                             + swept.orphan_snapshots
                             + swept.spent_nonces
+                            + swept.aged_outcomes
                             > 0
                         {
                             tracing::info!(
@@ -148,6 +175,7 @@ async fn main() {
                                 orphan_incoming = swept.orphan_incoming,
                                 orphan_snapshots = swept.orphan_snapshots,
                                 spent_nonces = swept.spent_nonces,
+                                aged_outcomes = swept.aged_outcomes,
                                 "swept"
                             );
                         }

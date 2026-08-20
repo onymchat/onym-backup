@@ -105,6 +105,23 @@ impl Store {
             -- Kept because §12 exports them and a holder may need to
             -- re-present one. `excluded_scope` is the reason: what an
             -- erasure did not reach outlives the snapshot it describes.
+            -- Every terms document this operator has ever published.
+            --
+            -- §4.1 requires serving them forever, and a retained
+            -- snapshot pins one — so a document that lived only in the
+            -- process that minted it would leave a holder, after a
+            -- restart under new terms, holding a `termsId` whose
+            -- preimage is gone. That is a pin pointing at nothing:
+            -- no way to check what retention, jurisdiction or erasure
+            -- scope the snapshot was accepted under. §12 needs the same
+            -- bytes for the export container.
+            CREATE TABLE IF NOT EXISTS terms_documents (
+                terms_id    TEXT PRIMARY KEY,
+                raw         BLOB NOT NULL,
+                signature   BLOB NOT NULL,
+                first_seen  TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS erasure_receipts (
                 receipt_id    TEXT PRIMARY KEY,
                 holder_handle TEXT NOT NULL,
@@ -203,13 +220,33 @@ impl Store {
 
     /// What this holder has retained, newest first.
     pub fn snapshots(&self, handle: &str) -> Result<Vec<RetainedRow>> {
-        let mut statement = self.connection.prepare(
+        self.listed(handle, true)
+    }
+
+    /// Everything the holder has ever had here, erased rows included.
+    ///
+    /// `list` reports those as `erased` rather than omitting them.
+    /// §5.7 makes `erased` a distinct status for a reason: a holder who
+    /// asks about a digest they erased is owed that answer, not a
+    /// silence that reads the same as never having stored it.
+    pub fn snapshots_including_erased(&self, handle: &str) -> Result<Vec<RetainedRow>> {
+        self.listed(handle, false)
+    }
+
+    fn listed(&self, handle: &str, live_only: bool) -> Result<Vec<RetainedRow>> {
+        let mut statement = self.connection.prepare(if live_only {
             "SELECT digest, algorithm, sealed_byte_size, accepted_terms_id, supersedes,
-                    retained_at, retained_until
+                    retained_at, retained_until, erased_at
              FROM snapshots
              WHERE holder_handle = ?1 AND erased_at IS NULL
-             ORDER BY retained_at DESC",
-        )?;
+             ORDER BY retained_at DESC"
+        } else {
+            "SELECT digest, algorithm, sealed_byte_size, accepted_terms_id, supersedes,
+                    retained_at, retained_until, erased_at
+             FROM snapshots
+             WHERE holder_handle = ?1
+             ORDER BY retained_at DESC"
+        })?;
         let rows = statement
             .query_map([handle], |row| {
                 Ok(RetainedRow {
@@ -220,6 +257,7 @@ impl Store {
                     supersedes: row.get(4)?,
                     retained_at: row.get(5)?,
                     retained_until: row.get(6)?,
+                    erased_at: row.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -359,6 +397,103 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Record a terms document, if it is not already known.
+    ///
+    /// Called at boot with the current terms. Idempotent: the same
+    /// document across restarts is one row, and a *different* one adds
+    /// a row rather than replacing — which is the entire point.
+    pub fn remember_terms(&self, terms_id: &str, raw: &[u8], signature: &[u8], now: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO terms_documents (terms_id, raw, signature, first_seen)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![terms_id, raw, signature, now],
+        )?;
+        Ok(())
+    }
+
+    /// A published terms document by id, with its detached signature.
+    pub fn terms_document(&self, terms_id: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT raw, signature FROM terms_documents WHERE terms_id = ?1")?;
+        let mut rows = statement.query_map([terms_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Snapshots in an erasure's scope: one digest, or all of them.
+    pub fn snapshots_in_scope(&self, handle: &str, scope: &str) -> Result<Vec<RetainedRow>> {
+        let all = self.snapshots(handle)?;
+        if scope == "all" {
+            return Ok(all);
+        }
+        Ok(all.into_iter().filter(|row| row.digest == scope).collect())
+    }
+
+    /// Mark a snapshot erased. The row survives its bytes: `list` must
+    /// be able to answer `erased` rather than forgetting, and a holder
+    /// who asks about a digest they erased deserves better than a 404
+    /// that reads like it never existed.
+    pub fn mark_erased(&self, handle: &str, digest: &str, erased_at: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE snapshots SET erased_at = ?3
+             WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NULL",
+            rusqlite::params![handle, digest, erased_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_receipt(
+        &self,
+        receipt_id: &str,
+        handle: &str,
+        scope: &str,
+        terms_id: &str,
+        raw: &[u8],
+        issued_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO erasure_receipts
+                (receipt_id, holder_handle, scope, terms_id, raw, issued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![receipt_id, handle, scope, terms_id, raw, issued_at],
+        )?;
+        Ok(())
+    }
+
+    /// This holder's receipts, for §12's container.
+    pub fn receipts(&self, handle: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT receipt_id, raw FROM erasure_receipts
+             WHERE holder_handle = ?1 ORDER BY issued_at",
+        )?;
+        let rows = statement.query_map([handle], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The outcome recorded for one holder's operation, if any.
+    pub fn outcome(&self, handle: &str, operation_id: &str) -> Result<Option<(String, String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT digest, status, recorded_at FROM operation_outcomes
+             WHERE holder_handle = ?1 AND operation_id = ?2",
+        )?;
+        let mut rows = statement.query_map(rusqlite::params![handle, operation_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Drop outcome records past the declared window.
+    ///
+    /// The window is short on purpose: keeping an operation id is the
+    /// per-holder timing trace §15 otherwise forbids, so it is a
+    /// declared few hours rather than an exception.
+    pub fn sweep_outcomes(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM operation_outcomes WHERE recorded_at < ?1",
+            [older_than],
+        )?)
+    }
+
     /// A grant this holder already holds for this digest, if one is
     /// still live.
     ///
@@ -472,6 +607,7 @@ pub struct RetainedRow {
     pub supersedes: Option<String>,
     pub retained_at: String,
     pub retained_until: Option<String>,
+    pub erased_at: Option<String>,
 }
 
 #[cfg(test)]

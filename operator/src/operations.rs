@@ -1,0 +1,159 @@
+//! `GET /v1/operations/{operationId}` — reconciling a lost response.
+//!
+//! §14.9's rule is the whole point: **`unknown` is preserved as
+//! `unknown`.** A client that lost a response asks here rather than
+//! guessing, and an operator that answered "retained" for an operation
+//! it has no record of would turn a client's uncertainty into a false
+//! certainty — which is worse than the uncertainty.
+//!
+//! A `404` is therefore not evidence the operation failed. The window
+//! is short on purpose (§15: keeping an operation id is a per-holder
+//! timing trace), and a client that has aged past it reconciles by
+//! reference through `listSnapshots` instead.
+
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+use time::OffsetDateTime;
+
+use crate::api::AppState;
+use crate::auth::authenticate;
+use crate::error::{Error, Resource, Result};
+
+pub async fn query(
+    State(state): State<Arc<AppState>>,
+    Path(operation_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let now = OffsetDateTime::now_utc();
+    let path = format!("/v1/operations/{operation_id}");
+
+    let store = state.store.lock().await;
+    let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
+
+    // Scoped to the asking holder. The id is client-chosen, so an
+    // unscoped lookup would let one holder read another's outcome by
+    // guessing — and the ids are only as unguessable as the client
+    // that minted them.
+    let (digest, status, recorded_at) = store
+        .outcome(&holder.handle, &operation_id)
+        .map_err(Error::from)?
+        .ok_or(Error::NotFound(Resource::Operation))?;
+
+    Ok(axum::Json(json!({
+        "outcome": {
+            "componentId": state.config.component_id,
+            "operationId": operation_id,
+            "status": status,
+            "digest": digest,
+            "recordedAt": recorded_at,
+        }
+    }))
+    .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::uploads::tests::Harness;
+    use axum::http::StatusCode;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    /// The §14.9 case: a lost commit response is reconciled by asking,
+    /// not by guessing.
+    #[tokio::test]
+    async fn a_committed_operation_can_be_reconciled() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let body = harness.preflight_body(&snapshot, &terms);
+        let operation_id = serde_json::from_slice::<Value>(&body).unwrap()["operationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (_, grant) = harness.send("POST", "/v1/preflight", body).await;
+        let grant: Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        for index in 0..3usize {
+            let end = usize::min(index * 8 + 8, snapshot.len());
+            harness
+                .send(
+                    "PUT",
+                    &format!("/v1/uploads/{upload_id}/chunks/{index}"),
+                    snapshot[index * 8..end].to_vec(),
+                )
+                .await;
+        }
+        harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+
+        let (status, body) = harness
+            .send("GET", &format!("/v1/operations/{operation_id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["outcome"]["status"], "retained");
+        assert_eq!(
+            outcome["outcome"]["digest"],
+            serde_json::json!(format!("sha256:{}", hex::encode(Sha256::digest(&snapshot))))
+        );
+    }
+
+    /// An operation the operator has no record of is a 404, and a 404
+    /// is not "it failed". §14.9 keeps `unknown` as `unknown`; the
+    /// operator's part of that is never inventing an outcome.
+    #[tokio::test]
+    async fn an_unknown_operation_is_not_an_outcome() {
+        let harness = Harness::new(vec![]);
+        let (status, body) = harness
+            .send("GET", "/v1/operations/never-happened", vec![])
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "operation_not_found");
+    }
+
+    /// The id is client-chosen, so an unscoped lookup would let one
+    /// holder read another's outcome by guessing.
+    #[tokio::test]
+    async fn one_holder_cannot_read_anothers_outcome() {
+        let harness = Harness::new(vec![]);
+        let mut stranger = Harness::new(vec![]);
+        stranger.state = harness.state.clone();
+        stranger.signing = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let body = harness.preflight_body(&snapshot, &terms);
+        let operation_id = serde_json::from_slice::<Value>(&body).unwrap()["operationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, grant) = harness.send("POST", "/v1/preflight", body).await;
+        let grant: Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        for index in 0..3usize {
+            let end = usize::min(index * 8 + 8, snapshot.len());
+            harness
+                .send(
+                    "PUT",
+                    &format!("/v1/uploads/{upload_id}/chunks/{index}"),
+                    snapshot[index * 8..end].to_vec(),
+                )
+                .await;
+        }
+        harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+
+        let (status, _) = stranger
+            .send("GET", &format!("/v1/operations/{operation_id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}

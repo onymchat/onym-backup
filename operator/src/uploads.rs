@@ -406,7 +406,7 @@ pub async fn commit(
 }
 
 /// Run blob work on the blocking pool, off the store lock.
-async fn blocking<T, F>(state: &Arc<AppState>, work: F) -> Result<T>
+pub async fn blocking<T, F>(state: &Arc<AppState>, work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&AppState) -> Result<T> + Send + 'static,
@@ -438,7 +438,11 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         now,
     )?;
 
-    let rows = store.snapshots(&holder.handle)?;
+    // Erased rows included, reported as `erased`. §5.7 makes that a
+    // distinct status because a holder asking about a digest they
+    // erased is owed that answer rather than a silence indistinguishable
+    // from never having stored it.
+    let rows = store.snapshots_including_erased(&holder.handle)?;
     let body: Vec<_> = rows
         .into_iter()
         .map(|row| {
@@ -453,7 +457,8 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
                 "retainedAt": row.retained_at,
                 "retainedUntil": row.retained_until,
                 "supersedes": row.supersedes,
-                "status": "retained",
+                "erasedAt": row.erased_at,
+                "status": if row.erased_at.is_some() { "erased" } else { "retained" },
             })
         })
         .collect();
@@ -500,7 +505,7 @@ pub async fn download(
 }
 
 /// The snapshot's bytes, chunk by chunk, a bounded buffer at a time.
-fn snapshot_stream(
+pub fn snapshot_stream(
     paths: Vec<std::path::PathBuf>,
 ) -> impl futures_core::Stream<Item = std::io::Result<Bytes>> {
     async_stream::try_stream! {
@@ -531,7 +536,7 @@ fn has_expired(expires_at: &str, now: OffsetDateTime) -> Result<bool> {
 }
 
 /// `sha256:<64 lowercase hex>` → the hex, or a refusal.
-fn digest_hex(digest: &str) -> Result<String> {
+pub fn digest_hex(digest: &str) -> Result<String> {
     let hex_value = digest
         .strip_prefix("sha256:")
         .ok_or_else(|| Error::BadRequest("digest must be sha256:<hex>".into()))?;
@@ -548,7 +553,7 @@ fn digest_hex(digest: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::api::{router, AppState};
     use crate::auth;
@@ -562,14 +567,14 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
-    struct Harness {
-        state: Arc<AppState>,
-        signing: SigningKey,
+    pub struct Harness {
+        pub state: Arc<AppState>,
+        pub signing: SigningKey,
         _dir: tempfile::TempDir,
     }
 
     impl Harness {
-        fn new(issuers: Vec<String>) -> Harness {
+        pub fn new(issuers: Vec<String>) -> Harness {
             let dir = tempfile::TempDir::new().unwrap();
             let mut config = Config::for_tests("onym:component:test", issuers);
             config.chunk_bytes = 8;
@@ -577,27 +582,32 @@ mod tests {
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
             let documents = Documents::build(&config, &signing_key).unwrap();
             Harness {
-                state: Arc::new(AppState {
-                    config,
-                    documents,
-                    store: tokio::sync::Mutex::new(Store::in_memory().unwrap()),
-                    blobs: crate::blobs::Blobs::new(dir.path()),
-                }),
+                state: Arc::new(
+                    AppState::new(
+                        config,
+                        documents,
+                        Store::in_memory().unwrap(),
+                        crate::blobs::Blobs::new(dir.path()),
+                        signing_key.clone(),
+                        "2026-01-01T00:00:00Z",
+                    )
+                    .unwrap(),
+                ),
                 signing: SigningKey::from_bytes(&[5u8; 32]),
                 _dir: dir,
             }
         }
 
         /// The blinded handle the operator knows this holder by.
-        fn handle(&self) -> String {
+        pub fn handle(&self) -> String {
             payload::holder_handle(&self.signing.verifying_key())
         }
 
-        fn terms_id(&self) -> String {
+        pub fn terms_id(&self) -> String {
             self.state.documents.terms.0.clone()
         }
 
-        async fn send(&self, method: &str, path: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+        pub async fn send(&self, method: &str, path: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
             let reference = format!(
                 "onym:seat-key:{}",
                 hex::encode(self.signing.verifying_key().as_bytes())
@@ -629,7 +639,7 @@ mod tests {
             (status, bytes)
         }
 
-        fn preflight_body(&self, snapshot: &[u8], terms: &str) -> Vec<u8> {
+        pub fn preflight_body(&self, snapshot: &[u8], terms: &str) -> Vec<u8> {
             let digest = format!("sha256:{}", hex::encode(Sha256::digest(snapshot)));
             serde_json::to_vec(&json!({
                 "version": 1,
@@ -646,7 +656,7 @@ mod tests {
         }
 
         /// Preflight, upload every chunk, commit.
-        async fn store_snapshot(&self, snapshot: &[u8]) -> (StatusCode, Vec<u8>) {
+        pub async fn store_snapshot(&self, snapshot: &[u8]) -> (StatusCode, Vec<u8>) {
             let terms = self.terms_id();
             let (status, body) = self.send("POST", "/v1/preflight", self.preflight_body(snapshot, &terms)).await;
             assert_eq!(status, StatusCode::OK, "preflight: {}", String::from_utf8_lossy(&body));

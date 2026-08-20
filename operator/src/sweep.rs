@@ -34,6 +34,7 @@ pub struct Swept {
     pub orphan_incoming: usize,
     pub orphan_snapshots: usize,
     pub spent_nonces: usize,
+    pub aged_outcomes: usize,
 }
 
 /// Runs at boot and then on a timer, on the blocking pool. Failures are
@@ -43,12 +44,19 @@ pub struct Swept {
 /// Synchronous by design — it does blocking disk work, so it belongs on
 /// a blocking thread, and `blocking_lock` is the right way to take the
 /// store from one.
-pub fn reconcile(store: &Mutex<Store>, blobs: &Blobs, now: &str, nonce_floor: &str) -> Swept {
+pub fn reconcile(
+    store: &Mutex<Store>,
+    blobs: &Blobs,
+    now: &str,
+    nonce_floor: &str,
+    outcome_floor: &str,
+) -> Swept {
     let mut swept = Swept {
         expired_grants: 0,
         orphan_incoming: 0,
         orphan_snapshots: 0,
         spent_nonces: 0,
+        aged_outcomes: 0,
     };
 
     // (1) Grants that ran out. The bytes go first: if the row survives
@@ -134,6 +142,17 @@ pub fn reconcile(store: &Mutex<Store>, blobs: &Blobs, now: &str, nonce_floor: &s
         Err(error) => tracing::warn!(%error, "could not sweep nonces"),
     }
 
+    // (5) Outcome records past the declared window. Keeping an
+    // operation id is the per-holder timing trace §15 otherwise
+    // forbids, so the window is short and something has to enforce it.
+    // A `404` afterwards is not evidence the operation failed — the
+    // client reconciles by reference instead — which is what makes a
+    // short window affordable.
+    match store.blocking_lock().sweep_outcomes(outcome_floor) {
+        Ok(count) => swept.aged_outcomes = count,
+        Err(error) => tracing::warn!(%error, "could not sweep outcomes"),
+    }
+
     swept
 }
 
@@ -174,7 +193,7 @@ mod tests {
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         assert_eq!(swept.expired_grants, 1);
         assert!(store.blocking_lock().upload("u1").unwrap().is_none());
         assert!(blobs.incoming_on_disk().is_empty());
@@ -194,7 +213,7 @@ mod tests {
             .unwrap();
         blobs.begin_upload("u1").unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z");
+        let swept = reconcile(&store, &blobs, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z");
         assert_eq!(swept.expired_grants, 0);
         assert_eq!(swept.orphan_incoming, 0);
         assert!(store.blocking_lock().upload("u1").unwrap().is_some());
@@ -210,7 +229,7 @@ mod tests {
         blobs.write_chunk("u1", 0, b"abc").unwrap();
         blobs.commit("u1", HANDLE, "aa").unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         assert_eq!(swept.orphan_snapshots, 1);
         assert!(blobs.read_snapshot(HANDLE, "aa").is_err());
         // And nothing was invented: the operator does not now claim to
@@ -231,7 +250,7 @@ mod tests {
             .retain(&upload_row("u1", HANDLE, "sha256:aa"), "2026-01-01T00:00:00Z")
             .unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         assert_eq!(swept.orphan_snapshots, 0);
         assert_eq!(blobs.read_snapshot(HANDLE, "aa").unwrap(), b"abc");
     }
@@ -254,7 +273,7 @@ mod tests {
             .record_nonce(HANDLE, "fresh", "2026-01-01T12:00:00Z")
             .unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T12:00:00Z", "2026-01-01T06:00:00Z");
+        let swept = reconcile(&store, &blobs, "2026-01-01T12:00:00Z", "2026-01-01T06:00:00Z", "2026-01-01T12:00:00Z");
         assert_eq!(swept.spent_nonces, 1);
 
         // The one still inside the window is still refused, which is

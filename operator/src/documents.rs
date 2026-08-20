@@ -120,6 +120,14 @@ fn write_json_string(text: &str, out: &mut Vec<u8>) {
 pub struct Documents {
     pub manifest: Vec<u8>,
     pub profile: Vec<u8>,
+    /// Detached Ed25519 over the **exact served bytes** of the
+    /// manifest — not over its canonical form. §4.1 says served bytes,
+    /// and the difference matters: the embedded `signature` covers the
+    /// canonical document minus itself, so a verifier checking the
+    /// detached one against canonical bytes would fail on a document
+    /// that is perfectly valid.
+    pub manifest_signature: String,
+    pub terms_signature: String,
     /// `(termsId, bytes)`. Only one set is minted here; historical terms
     /// are served from disk in a later slice, because they must outlive
     /// any single boot.
@@ -144,6 +152,8 @@ impl Documents {
         )?;
 
         Ok(Documents {
+            manifest_signature: detached(&manifest, signing),
+            terms_signature: detached(&terms, signing),
             manifest,
             profile: serde_json::to_vec(&profile_document())
                 .map_err(|e| Error::Internal(e.to_string()))?,
@@ -207,6 +217,22 @@ fn profile_document() -> Value {
         "authentication": [AUTHENTICATION],
         "paymentRefusal": PAYMENT_REFUSAL,
     })
+}
+
+/// A detached signature over exactly these bytes.
+fn detached(bytes: &[u8], signing: &SigningKey) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(signing.sign(bytes).to_bytes())
+}
+
+/// Sign an erasure receipt over its canonical bytes.
+///
+/// Public because §11's receipt is minted per request rather than at
+/// boot, and it is signed by the same key that signs the manifest and
+/// the terms: a holder who can check one can check all three without
+/// learning a second key.
+pub fn sign_receipt(receipt: Value, signing: &SigningKey) -> Result<Vec<u8>> {
+    sign(receipt, signing, &["signature"])
 }
 
 /// The starting terms.
@@ -359,5 +385,42 @@ mod tests {
         let excluded = terms["erasure"]["excluded"].as_str().unwrap();
         assert!(!excluded.trim().is_empty());
         assert!(excluded.contains("other participants"));
+    }
+
+    /// §4.1: a detached signature over **the exact served bytes**.
+    ///
+    /// Not over canonical bytes. The embedded `signature` covers the
+    /// canonical document minus itself, so the two are different
+    /// signatures over different inputs — and a verifier handed the
+    /// detached one, checking it the way it would check the embedded
+    /// one, would reject a perfectly valid document.
+    #[test]
+    fn detached_signatures_cover_the_bytes_that_are_served() {
+        let (documents, signing) = documents();
+        let key = signing.verifying_key();
+
+        for (name, bytes, detached) in [
+            ("manifest", &documents.manifest, &documents.manifest_signature),
+            ("terms", &documents.terms.1, &documents.terms_signature),
+        ] {
+            let raw = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                detached,
+            )
+            .unwrap();
+            let signature = ed25519_dalek::Signature::from_slice(&raw).unwrap();
+            key.verify(bytes, &signature)
+                .unwrap_or_else(|_| panic!("{name}.sig does not cover the served bytes"));
+
+            // And it is genuinely a different signature from the
+            // embedded one, which is the thing that would otherwise go
+            // unnoticed.
+            let embedded: Value = serde_json::from_slice(bytes).unwrap();
+            assert_ne!(
+                embedded["signature"].as_str().unwrap(),
+                detached.as_str(),
+                "{name}.sig is the embedded signature, not a detached one"
+            );
+        }
     }
 }

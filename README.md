@@ -36,11 +36,13 @@ entitlement enforcement is a declared capability.
 
 ## Status
 
-A snapshot can be stored and read back: preflight, chunked upload,
-commit, list, download, with quota and grant expiry enforced and a
-reconciliation sweep that deletes bytes no row accounts for. Erase with
-signed receipts, export, and outcome reconciliation are next, along
-with the entitlement path for operators that charge.
+The §9 route table is complete apart from entitlements: preflight,
+chunked upload, commit, list, download, erase with signed receipts,
+export, and outcome reconciliation. Quota and grant expiry are
+enforced, every terms document is served forever, and a sweep deletes
+bytes no row accounts for. What remains is the paid path — verifying a
+broker's `SeatEntitlement`, polling revocation epochs, and the
+lapse/grace behaviour that hangs off them.
 
 ```
 BACKUP_COMPONENT_ID=onym:component:you \
