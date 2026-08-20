@@ -116,6 +116,17 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   all — [onym-system#41][gap] raises that gap — and the declaration says
   so rather than implying the profile already covers it.
 
+  The row is written for a holder the operator can still see has
+  lapsed, and also for one it can only infer: a snapshot committed on a
+  grant that outlived the records — which §9.2 explicitly allows, since
+  commit is ungated — leaves bytes with no horizon in either direction,
+  and the sweep adopts that holder with the clock started at first
+  observation. The true instant went with the record and cannot be
+  recovered; starting it late can only grant more notice and grace than
+  was owed. **Charging operators only.** On a free operator every
+  holder has snapshots and no entitlement record, so the same rule
+  ungated would lapse all of them.
+
 [gap]: https://github.com/onymchat/onym-system/issues/41
 - `erasedReferences` in `metadataRetention`, bounding what is remembered about a
   snapshot after its bytes are gone. `list` reports `erased` and a re-erase
@@ -151,6 +162,14 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   `offerId` — for as long as they kept paying, which is the per-holder
   payment diary §15 exists to prevent, reached by only ever sweeping
   the holders who had stopped.
+- **A lapsed holder with nothing retained now reads `Unpaid` rather
+  than `Lapsed`**, from about fifteen minutes after expiry instead of
+  weeks. Both refuse with `payment_required` and both name the same
+  offers, so the distinction only reaches a person if a client words
+  the two differently. It follows from holding the record to §15's
+  bound: once it is gone, and there is no snapshot to have written
+  lifecycle state for, the operator genuinely cannot tell "never paid"
+  from "paid once, kept nothing".
 - **`metadataRetention.entitlementRecords` is a duration** (`PT15M` by
   default), read as a window past `expiresAt` the way §15 reads the
   column and `uploadGrants` already declares it. It was prose, and both

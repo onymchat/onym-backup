@@ -452,19 +452,11 @@ pub fn record_floor(revocation_poll_secs: i64, now: OffsetDateTime) -> Result<Of
 /// Reduce a lapsed holder's entitlement records to the minimum needed
 /// to finish honouring §10.3, ahead of dropping them.
 ///
-/// Returns `None` for a holder with nothing to protect. That is the
-/// common case and it matters: a holder with no live snapshot is owed
-/// no notice, no grace and no post-grace action, so there is nothing
-/// for a row to carry and none is written. Retention state for someone
-/// the operator holds nothing about is just a record of a person.
-///
-/// `grace_expires_at` is the latest window end across their snapshots
-/// and bounds the row itself — it is not what any decision is made
-/// from. Each snapshot's own window is recomputed from its own pinned
-/// terms every time, before and after the record goes, because §10.3
-/// governs each snapshot by the terms it was accepted under and a
-/// holder-wide date would hand the older ones a window they never
-/// agreed to in one direction or the other.
+/// Returns `None` for a holder with nothing to protect. A holder with
+/// no live snapshot is owed no notice, no grace and no post-grace
+/// action, so there is nothing for a row to carry and none is written.
+/// Retention state about someone the operator holds nothing for is just
+/// a record of a person.
 pub fn derive_lapse_state(
     store: &Store,
     handle: &str,
@@ -473,7 +465,33 @@ pub fn derive_lapse_state(
     let Some(lapsed_at) = lifecycle_horizon(store, handle, revoked)? else {
         return Ok(None);
     };
+    lapse_state_at(store, handle, lapsed_at)
+}
 
+/// The same reduction, from an explicit lapse instant.
+///
+/// Split out because the sweep needs it three ways, and only one of
+/// them has a horizon to read. It refreshes a row against the holder's
+/// snapshots *as they are now*, and it adopts a holder whose records
+/// have gone with `lapsed_at` set to first observation.
+///
+/// `grace_expires_at` is the latest window end across the holder's live
+/// snapshots. **It bounds the row; it is not what any decision is made
+/// from, and it is not to be trusted as the window.** Each snapshot's
+/// own window is recomputed from its own pinned terms every time,
+/// before and after the record goes, because §10.3 governs each
+/// snapshot by the terms it was accepted under — and because a snapshot
+/// can arrive *after* this runs. A grant lives 24 hours and commit is
+/// deliberately ungated (§9.2), so a snapshot committed after the row
+/// was written is routine, and it can pin terms promising a longer
+/// window than anything the row knew about. Reading the stored value as
+/// the truth retires the row while that snapshot is still in grace and
+/// orphans it forever.
+pub fn lapse_state_at(
+    store: &Store,
+    handle: &str,
+    lapsed_at: OffsetDateTime,
+) -> Result<Option<crate::store::LapseState>> {
     let mut latest: Option<(OffsetDateTime, String)> = None;
     for row in store.snapshots(handle)? {
         let Some(clause) = end_of_payment(store, &row.accepted_terms_id)? else {
@@ -499,6 +517,37 @@ pub fn derive_lapse_state(
         grace_expires_at: stamp(ends)?,
         post_grace_action: after_grace,
     }))
+}
+
+/// Holders holding snapshots that nothing knows the lapse of.
+///
+/// A snapshot committed after the sweep dropped its holder's records —
+/// on a grant that outlived them, which §9.2 explicitly allows — leaves
+/// a holder with bytes, no entitlement record and no derived row. Both
+/// derivations then answer nothing: `evaluate` reads `Unpaid` and
+/// closes a grace window that never opened, and `post_grace_due` stays
+/// empty forever, so the bytes are held indefinitely and are invisible
+/// to the only step that could collect them.
+///
+/// **`lapsed_at` is set to first observation, not to a recovered
+/// instant.** The true one went with the record and cannot be got back.
+/// Starting the clock when the operator first notices is the generous
+/// reading — it can only ever grant more notice and grace than was
+/// owed, never less — and over-protecting a holder costs disk where
+/// under-protecting deletes their backup early.
+///
+/// Charging operators only. On a free operator *every* holder has
+/// snapshots and no entitlement record, so this would lapse all of them
+/// and then expire everything they hold. The caller gates it; this
+/// says so here as well, because the failure mode is quiet and total.
+pub fn unrecorded_lapsed_holders(store: &Store, revoked: &HashSet<String>) -> Result<Vec<String>> {
+    let mut adopted = Vec::new();
+    for handle in store.holders_with_snapshots()? {
+        if lifecycle_horizon(store, &handle, revoked)?.is_none() {
+            adopted.push(handle);
+        }
+    }
+    Ok(adopted)
 }
 
 /// The gate every §9 route passes through.
@@ -549,10 +598,14 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
-    /// A charging operator, a holder who has paid, and one snapshot
-    /// retained under the default terms — `notice: P14D`,
-    /// `grace: P30D`, `duringGrace: [download, export, erase]`.
-    async fn holder_with_a_snapshot() -> (Harness, Vec<u8>, String) {
+    /// A charging operator and a holder who has paid, with the
+    /// credential registered and then put away.
+    ///
+    /// Split from `holder_with_a_snapshot` because "entitled, holding
+    /// nothing yet" is its own state and the sweep treats it very
+    /// differently: there is nothing for a `LapseState` to protect, so
+    /// none is written when the records go.
+    async fn entitled_holder() -> (Harness, String) {
         let signing = SigningKey::from_bytes(&[3u8; 32]);
         let issuer = format!(
             "onym:key:{}",
@@ -592,12 +645,26 @@ mod tests {
         );
         harness.holding(Some(credential.clone()));
 
+        // Register it without storing anything: any authenticated
+        // request the credential rides on is enough.
+        let (status, _) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Stop carrying it. From here the operator knows only what it
+        // registered.
+        harness.holding(None);
+        (harness, credential)
+    }
+
+    /// The same, plus one snapshot retained under the default terms —
+    /// `notice: P14D`, `grace: P30D`,
+    /// `duringGrace: [download, export, erase]`.
+    async fn holder_with_a_snapshot() -> (Harness, Vec<u8>, String) {
+        let (harness, credential) = entitled_holder().await;
+        harness.holding(Some(credential.clone()));
         let snapshot: Vec<u8> = (0..20u8).collect();
         let (status, body) = harness.store_snapshot(&snapshot).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-
-        // Stop carrying the credential. From here the operator knows
-        // only what it registered.
         harness.holding(None);
         (harness, snapshot, credential)
     }
@@ -666,9 +733,18 @@ mod tests {
 
     /// One pass of the real sweep, at the real entitlement floor.
     fn sweep_now(harness: &Harness, revoked: &HashSet<String>) -> crate::sweep::Swept {
+        sweep_at(harness, revoked, true, OffsetDateTime::now_utc())
+    }
+
+    /// The same, on a stated clock and for a stated kind of operator.
+    fn sweep_at(
+        harness: &Harness,
+        revoked: &HashSet<String>,
+        charges: bool,
+        at: OffsetDateTime,
+    ) -> crate::sweep::Swept {
         let poll = crate::config::Config::for_tests("onym:component:test", vec![])
             .revocation_poll_secs as i64;
-        let at = OffsetDateTime::now_utc();
         tokio::task::block_in_place(|| {
             let floor = record_floor(poll, at).unwrap().format(&Rfc3339).unwrap();
             crate::sweep::reconcile(
@@ -676,6 +752,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 revoked,
+                charges,
                 at,
                 crate::sweep::Cutoffs {
                     now: &at.format(&Rfc3339).unwrap(),
@@ -687,6 +764,233 @@ mod tests {
                 },
             )
         })
+    }
+
+    /// A snapshot that arrives after its holder's records have gone is
+    /// not invisible forever.
+    ///
+    /// A grant lives 24 hours; a record goes at `expiresAt` plus 15
+    /// minutes; and §9.2 makes commit ungated so a grant the operator
+    /// already agreed to take stays finishable. Those three together
+    /// make this ordering routine rather than exotic — and it used to
+    /// leave a holder with bytes, no entitlement record and no derived
+    /// row, which is a horizon of `None` in both directions. `evaluate`
+    /// answered `Unpaid`, closing a grace window that had never opened,
+    /// and `post_grace_due` stayed empty forever, so the bytes were
+    /// held indefinitely and step (0) could not see them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_committed_after_the_records_went_is_not_orphaned() {
+        let (harness, credential) = entitled_holder().await;
+        let terms = harness.terms_id();
+        let bytes: Vec<u8> = (0..20u8).collect();
+
+        // Mint a grant while entitled. §9.2: the entitlement was
+        // checked here, and that check is what the grant carries.
+        harness.holding(Some(credential));
+        let (status, body) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&bytes, &terms))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let grant: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        let chunk_bytes = grant["chunkBytes"].as_u64().unwrap() as usize;
+        let chunk_count = grant["chunkCount"].as_u64().unwrap() as usize;
+        harness.holding(None);
+
+        // The records reach §15's bound and go. The holder has nothing
+        // retained, so nothing is derived — correctly, at this instant.
+        lapsed_days_ago(&harness, 1).await;
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(swept.aged_entitlements, 1);
+        assert!(
+            harness.state.store.lock().await.lapse_state(&harness.handle()).unwrap().is_none(),
+            "a holder with nothing retained was given a lapse record"
+        );
+
+        // The grant finishes anyway, which is the whole point of §9.2.
+        for index in 0..chunk_count {
+            let start = index * chunk_bytes;
+            let chunk = bytes[start..usize::min(start + chunk_bytes, bytes.len())].to_vec();
+            let (status, _) = harness
+                .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/{index}"), chunk)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, body) = harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // Now there are bytes and no horizon at all. The next sweep
+        // adopts the holder, starting the clock at first observation —
+        // the true instant went with the record and cannot be got back,
+        // and starting it now grants more than was owed rather than
+        // less.
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(swept.post_grace_snapshots, 0, "the snapshot was expired on sight");
+        let adopted = harness
+            .state
+            .store
+            .lock()
+            .await
+            .lapse_state(&harness.handle())
+            .unwrap()
+            .expect("a snapshot with no horizon was left invisible to the sweep");
+        assert_eq!(adopted.post_grace_action, "erase");
+
+        // Protected for its full window, as §10.3 promises.
+        let hex_digest = hex::encode(Sha256::digest(&bytes));
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the grace window never opened");
+
+        // And expired at the end of it, rather than held forever.
+        lapsed_days_ago(&harness, 50).await;
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(swept.post_grace_snapshots, 1, "the snapshot was orphaned");
+        assert!(
+            !harness
+                .state
+                .blobs
+                .retained_on_disk()
+                .into_iter()
+                .any(|(_, digest)| digest == hex_digest),
+            "the bytes outlived the retention that justified holding them"
+        );
+    }
+
+    /// The stored `grace_expires_at` is a declaration, not the window.
+    ///
+    /// The row is written once and the holder's snapshots keep moving:
+    /// a commit landing afterwards, on a grant that outlived the
+    /// records, pins its own terms and can promise a longer window than
+    /// anything the row knew about. A retirement step that trusted the
+    /// stored value would find nothing due at the stale `ends`, drop
+    /// the row, and take the horizon with it — leaving the newer
+    /// snapshot with no lapse to derive from and no way ever to be
+    /// expired. So the window is re-derived from the snapshots every
+    /// pass, and the row is corrected rather than believed.
+    ///
+    /// Simulated by winding the stored bound into the past, which is
+    /// the same disagreement seen from the row's side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_window_is_re_derived_rather_than_retired() {
+        let (harness, snapshot, _) = holder_with_a_snapshot().await;
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+
+        // One day past expiry: the records go, a row is written, and
+        // the real window has six weeks left to run.
+        lapsed_days_ago(&harness, 1).await;
+        sweep_now(&harness, &HashSet::new());
+        assert!(
+            harness.state.store.lock().await.lapse_state(&harness.handle()).unwrap().is_some()
+        );
+
+        // The row now under-states the window — as it would after a
+        // later commit pinned longer terms.
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .connection_for_tests()
+            .execute(
+                "UPDATE lapse_state SET grace_expires_at = '2001-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(
+            swept.forgotten_lapse_state, 0,
+            "the row was retired on a bound the snapshots disagree with"
+        );
+        assert_eq!(swept.post_grace_snapshots, 0);
+
+        // Corrected, not merely survived: the declaration has to be
+        // true, because it is what `metadataRetention.lapseState` says.
+        let refreshed = harness
+            .state
+            .store
+            .lock()
+            .await
+            .lapse_state(&harness.handle())
+            .unwrap()
+            .expect("the horizon was dropped");
+        assert_ne!(refreshed.grace_expires_at, "2001-01-01T00:00:00Z");
+        assert!(
+            OffsetDateTime::parse(&refreshed.grace_expires_at, &Rfc3339).unwrap()
+                > OffsetDateTime::now_utc(),
+            "the refreshed bound is still in the past"
+        );
+
+        // And the snapshot is still expired at the end of the real
+        // window, which is what the row was kept for.
+        lapsed_days_ago(&harness, 50).await;
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(swept.post_grace_snapshots, 1, "the snapshot was orphaned");
+        assert!(
+            !harness
+                .state
+                .blobs
+                .retained_on_disk()
+                .into_iter()
+                .any(|(_, digest)| digest == hex_digest)
+        );
+    }
+
+    /// A free operator lapses nobody, however long it runs.
+    ///
+    /// **The trap the adoption step above walks past.** "Has snapshots,
+    /// no entitlement record, no lapse row" is the signature of a
+    /// holder whose records aged out — and it is also true of every
+    /// holder on an operator that never charged, because the table is
+    /// empty by construction. Adopting on that signature alone would
+    /// lapse every free-mode holder and then delete everything they
+    /// held once grace ran out. `reconcile` is told whether the
+    /// operator charges for precisely this reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_free_operator_lapses_nobody() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let (status, body) = harness.store_snapshot(&snapshot).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // Well past any notice-and-grace this operator publishes, and
+        // more than once, because adoption would show up on the pass
+        // after the one that wrote the row.
+        for days in [1i64, 400, 800] {
+            let swept = sweep_at(
+                &harness,
+                &HashSet::new(),
+                false,
+                OffsetDateTime::now_utc() + time::Duration::days(days),
+            );
+            assert_eq!(
+                swept.post_grace_snapshots, 0,
+                "a free operator expired a snapshot for non-payment"
+            );
+            assert!(
+                harness
+                    .state
+                    .store
+                    .lock()
+                    .await
+                    .lapse_state(&harness.handle())
+                    .unwrap()
+                    .is_none(),
+                "a free operator lapsed a holder who was never charged"
+            );
+        }
+
+        // Still there, and still served.
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+        let (status, bytes) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, snapshot);
     }
 
     /// §15 bounds each *record* at its own `expiresAt` plus one epoch
@@ -945,6 +1249,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &HashSet::new(),
+                true,
                 OffsetDateTime::now_utc(),
                 crate::sweep::Cutoffs {
                     now: &OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
@@ -1013,6 +1318,7 @@ mod tests {
                     &harness.state.blob_mutations,
                     &harness.state.blobs,
                     &HashSet::new(),
+                    true,
                     at,
                     crate::sweep::Cutoffs {
                         now: &at.format(&Rfc3339).unwrap(),
@@ -1304,6 +1610,7 @@ mod tests {
                     &harness.state.blob_mutations,
                     &harness.state.blobs,
                     &revoked,
+                    true,
                     at,
                     crate::sweep::Cutoffs {
                         now: &at.format(&Rfc3339).unwrap(),

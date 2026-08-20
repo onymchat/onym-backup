@@ -269,6 +269,12 @@ async fn main() {
                             &state.blob_mutations,
                             &state.blobs,
                             &state.revocation.revoked(),
+                            // Whether a lapse is even a thing that can
+                            // happen here. A free operator's holders all
+                            // have snapshots and no entitlement record,
+                            // which is indistinguishable from a lapsed
+                            // holder unless the sweep is told.
+                            state.config.requires_entitlement(),
                             at,
                             sweep::Cutoffs {
                                 now: &now,

@@ -749,9 +749,17 @@ impl Store {
 
     /// Persist the derived lifecycle state for a lapsed holder.
     ///
-    /// `INSERT OR REPLACE`, so a later pass that finds a longer window
-    /// — a snapshot committed on a grant that outlived the lapse pins
-    /// its own terms — widens the row rather than being ignored.
+    /// `INSERT OR REPLACE` because the row is rewritten as well as
+    /// written: the sweep re-derives it against the holder's snapshots
+    /// every pass and stores the result when it has moved. **That
+    /// caller is the reason for it** — a snapshot committed on a grant
+    /// that outlived the records pins its own terms and can promise a
+    /// longer window than the row was written with, and a bound the
+    /// operator has already passed is a false declaration whichever
+    /// direction it is wrong in.
+    ///
+    /// An earlier version of this comment claimed the widening without
+    /// there being any caller that widened. The handling exists now.
     pub fn record_lapse_state(&self, handle: &str, state: &LapseState) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO lapse_state

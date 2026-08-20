@@ -766,6 +766,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
@@ -916,6 +917,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
@@ -1112,6 +1114,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
@@ -1354,6 +1357,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
@@ -1394,6 +1398,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
@@ -1434,6 +1439,7 @@ mod tests {
                 &harness.state.blob_mutations,
                 &harness.state.blobs,
                 &std::collections::HashSet::new(),
+                false,
                 time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
                 crate::sweep::Cutoffs {
                     now: "2099-01-01T00:00:00Z",
