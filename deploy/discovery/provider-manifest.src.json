@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "implementationProfileId": "onym:discovery-implementation:static-ed25519-v1",
+  "providerId": "onym:component:onym-backup-qa",
+  "operator": "REPLACED_BY_PUBLISH_SH",
+  "seat": "discovery",
+  "catalogs": [
+    {
+      "catalogId": "backup-qa",
+      "snapshot": "https://DISCOVERY_HOST/catalogs/backup-qa.json",
+      "audience": "public",
+      "seatTypes": ["storage.backup"],
+      "policy": "REPLACED_BY_PUBLISH_SH",
+      "policyUri": "https://DISCOVERY_HOST/policy.md"
+    }
+  ],
+  "capabilities": ["signed-snapshot-v1", "local-filtering-v1"],
+  "privacyProfile": "REPLACED_BY_PUBLISH_SH",
+  "privacyProfileUri": "https://DISCOVERY_HOST/privacy.md",
+  "offers": [],
+  "validUntil": "REPLACED_BY_PUBLISH_SH"
+}

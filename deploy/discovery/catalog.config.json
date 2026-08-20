@@ -1,0 +1,19 @@
+{
+  "catalogId": "backup-qa",
+  "providerId": "onym:component:onym-backup-qa",
+  "policyDigest": "REPLACED_BY_PUBLISH_SH",
+  "expiryDays": 30,
+  "entries": [
+    {
+      "componentId": "onym:component:onym-backup-qa-operator",
+      "seatType": "storage.backup",
+      "manifest": { "uri": "https://OPERATOR_HOST/manifest.json" },
+      "manifestFile": "reviewed/operator-manifest.json",
+      "operator": "REPLACED_BY_PUBLISH_SH",
+      "profiles": ["onym:backup-implementation:object-http-v1"],
+      "listedAt": "REPLACED_BY_PUBLISH_SH",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    }
+  ]
+}
