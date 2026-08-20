@@ -75,6 +75,15 @@ pub enum Error {
         limit_bytes: i64,
     },
 
+    /// Commit arrived before every chunk did. The grant survives and
+    /// the response names the gap: a commit sent one chunk early must
+    /// cost one chunk, not the whole snapshot.
+    #[error("upload incomplete")]
+    UploadIncomplete {
+        missing_chunks: Vec<i64>,
+        chunk_count: i64,
+    },
+
     /// The grant ran out. Distinct from `upload_not_found`: the
     /// upload was real and the holder was right about it, they were
     /// just too late — and a client that re-preflights on 404 would
@@ -122,6 +131,7 @@ impl Error {
             Error::InvalidEntitlement { .. } => "invalid_entitlement",
             Error::SnapshotTooLarge { .. } => "snapshot_too_large",
             Error::QuotaExceeded { .. } => "quota_exceeded",
+            Error::UploadIncomplete { .. } => "upload_incomplete",
             Error::UploadExpired => "upload_expired",
             Error::ChunkMismatch => "chunk_mismatch",
             Error::DigestMismatch => "digest_mismatch",
@@ -140,6 +150,7 @@ impl Error {
             Error::SignatureInvalid | Error::InvalidEntitlement { .. } => StatusCode::UNAUTHORIZED,
             Error::TermsChanged { .. }
             | Error::QuotaExceeded { .. }
+            | Error::UploadIncomplete { .. }
             | Error::UploadExpired
             | Error::ChunkMismatch
             | Error::DigestMismatch => StatusCode::CONFLICT,
@@ -185,6 +196,18 @@ impl Error {
                 "maximumRetainedSnapshots": maximum_retained_snapshots,
                 "retainedBytes": retained_bytes,
                 "limitBytes": limit_bytes,
+            }),
+            Error::UploadIncomplete {
+                missing_chunks,
+                chunk_count,
+            } => json!({
+                // Capped: a client that has sent nothing does not need
+                // every index enumerated back at it, and the count is
+                // what tells them the difference between "one chunk
+                // short" and "start again".
+                "missingChunks": missing_chunks.iter().take(64).collect::<Vec<_>>(),
+                "missingChunkCount": missing_chunks.len(),
+                "chunkCount": chunk_count,
             }),
             _ => json!({}),
         }

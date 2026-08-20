@@ -94,6 +94,22 @@ pub async fn preflight(
     if reference.sealed_byte_size <= 0 {
         return Err(Error::BadRequest("sealedByteSize must be positive".into()));
     }
+    // Validated and then *stored*. §14's record table declares
+    // `supersedes` as state the profile's own operations require, and
+    // `listSnapshots` reports it — accepting the field and dropping it
+    // would make that column report a value no client ever set.
+    if let Some(previous) = request.supersedes.as_deref() {
+        digest_hex(previous)?;
+        if previous == reference.digest {
+            return Err(Error::BadRequest(
+                "a snapshot cannot supersede itself".into(),
+            ));
+        }
+    }
+
+    let now_stamp = now
+        .format(&Rfc3339)
+        .map_err(|e| Error::Internal(e.to_string()))?;
 
     // (1) Terms.
     if request.accepted_terms_id != state.documents.terms.0 {
@@ -129,6 +145,20 @@ pub async fn preflight(
         .into_response());
     }
 
+    // (3b) A grant this holder already has for this digest. Returned
+    // rather than replaced: a lost grant response otherwise leaves an
+    // orphan counting against the quota, and the holder can do nothing
+    // about it but wait for it to expire.
+    if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
+        return Ok(axum::Json(UploadGrant {
+            upload_id: open.upload_id,
+            chunk_bytes: open.chunk_bytes,
+            chunk_count: open.chunk_count,
+            expires_at: open.expires_at,
+        })
+        .into_response());
+    }
+
     // (4) Size.
     if reference.sealed_byte_size > state.config.maximum_sealed_snapshot_bytes {
         return Err(Error::SnapshotTooLarge {
@@ -144,9 +174,6 @@ pub async fn preflight(
     // uploads, each seeing the same count, and commit them all. Commit
     // re-checks and is the authoritative gate; counting grants here is
     // what keeps the refusal cheap, which is why preflight exists.
-    let now_stamp = now
-        .format(&Rfc3339)
-        .map_err(|e| Error::Internal(e.to_string()))?;
     let (retained, retained_bytes) = store.usage(&holder.handle)?;
     let committed = retained + store.open_grants(&holder.handle, &now_stamp)?;
     if committed >= state.config.maximum_retained_snapshots {
@@ -176,6 +203,7 @@ pub async fn preflight(
         chunk_bytes,
         chunk_count,
         &request.accepted_terms_id,
+        request.supersedes.as_deref(),
         &now_stamp,
         &expires_at,
     )?;
@@ -201,25 +229,34 @@ pub async fn put_chunk(
     body: Bytes,
 ) -> Result<Response> {
     let now = OffsetDateTime::now_utc();
-    let store = state.store.lock().await;
     let path = format!("/v1/uploads/{upload_id}/chunks/{index}");
-    let holder = authenticate(&headers, "PUT", &path, &body, &state.config, &store, now)?;
 
-    let upload = store
-        .upload(&upload_id)?
-        .ok_or(Error::NotFound(Resource::Upload))?;
-    // Scoped to the holder who started it. Without this, anyone who
-    // learned an upload id could write into someone else's snapshot.
-    if upload.holder_handle != holder.handle {
-        return Err(Error::NotFound(Resource::Upload));
-    }
-    if has_expired(&upload.expires_at, now)? {
-        return Err(Error::UploadExpired);
-    }
+    // The row check needs the lock; the write does not. This is the
+    // hot path — every chunk of every upload — and the idempotency
+    // read-back alone can be tens of megabytes, so holding the one
+    // global mutex across it would stall every other holder's request
+    // behind each chunk of each upload.
+    let upload = {
+        let store = state.store.lock().await;
+        let holder = authenticate(&headers, "PUT", &path, &body, &state.config, &store, now)?;
+        let upload = store
+            .upload(&upload_id)?
+            .ok_or(Error::NotFound(Resource::Upload))?;
+        // Scoped to the holder who started it. Without this, anyone who
+        // learned an upload id could write into someone else's
+        // snapshot.
+        if upload.holder_handle != holder.handle {
+            return Err(Error::NotFound(Resource::Upload));
+        }
+        if has_expired(&upload.expires_at, now)? {
+            return Err(Error::UploadExpired);
+        }
+        upload
+    };
+
     if index < 0 || index >= upload.chunk_count {
         return Err(Error::BadRequest("chunk index outside the grant".into()));
     }
-
     let expected = if index == upload.chunk_count - 1 {
         upload.sealed_byte_size - upload.chunk_bytes * (upload.chunk_count - 1)
     } else {
@@ -231,7 +268,11 @@ pub async fn put_chunk(
         )));
     }
 
-    state.blobs.write_chunk(&upload_id, index, &body)?;
+    blocking(&state, {
+        let id = upload_id.clone();
+        move |state| state.blobs.write_chunk(&id, index, &body)
+    })
+    .await?;
     Ok(StatusCode::OK.into_response())
 }
 
@@ -269,15 +310,30 @@ pub async fn commit(
         upload
     };
 
-    let received = blocking(&state, {
+    // Cheap check first: a truncated upload should not cost a hash of
+    // everything that did arrive.
+    //
+    // And an incomplete upload is *kept*, not discarded. A commit sent
+    // one chunk early — a lost chunk response is enough — would
+    // otherwise destroy every byte already received and call it a
+    // digest mismatch, making the client re-send hundreds of megabytes
+    // to recover from one missing chunk. It is told which indices are
+    // missing and the grant stays open.
+    let (received, missing) = blocking(&state, {
         let id = upload_id.clone();
         let count = upload.chunk_count;
-        move |state| state.blobs.received_bytes(&id, count)
+        move |state| state.blobs.arrival(&id, count)
     })
     .await?;
+    if !missing.is_empty() {
+        return Err(Error::UploadIncomplete {
+            missing_chunks: missing,
+            chunk_count: upload.chunk_count,
+        });
+    }
     if received != upload.sealed_byte_size {
-        // Cheap check first: a truncated upload should not cost a hash
-        // of everything that did arrive.
+        // Every chunk is present and the total is still wrong, which
+        // no retry fixes: the grant was minted for a different size.
         abandon(&state, &upload_id).await?;
         return Err(Error::DigestMismatch);
     }
@@ -839,6 +895,7 @@ mod tests {
                     8,
                     1,
                     &harness.terms_id(),
+                    None,
                     "2020-01-01T00:00:00Z",
                     "2020-01-02T00:00:00Z",
                 )
@@ -929,5 +986,133 @@ mod tests {
                 "{segment} produced {status}"
             );
         }
+    }
+
+    /// Accepted, stored, and reported back. `list` reads the column, so
+    /// dropping the field would have made it report a value no client
+    /// ever set.
+    #[tokio::test]
+    async fn supersedes_survives_the_upload() {
+        let harness = Harness::new(vec![]);
+        let first: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&first).await;
+        let first_digest = format!("sha256:{}", hex::encode(Sha256::digest(&first)));
+
+        let second: Vec<u8> = (50..70u8).collect();
+        let terms = harness.terms_id();
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&harness.preflight_body(&second, &terms)).unwrap();
+        body["supersedes"] = json!(first_digest);
+        let (status, grant) = harness
+            .send("POST", "/v1/preflight", serde_json::to_vec(&body).unwrap())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let grant: serde_json::Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        for index in 0..3usize {
+            let end = usize::min(index * 8 + 8, second.len());
+            harness
+                .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/{index}"), second[index * 8..end].to_vec())
+                .await;
+        }
+        let (status, _) = harness.send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+        let second_digest = format!("sha256:{}", hex::encode(Sha256::digest(&second)));
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["snapshotReference"]["digest"] == second_digest)
+            .expect("the second snapshot was not listed");
+        assert_eq!(row["supersedes"], json!(first_digest), "supersedes was dropped");
+    }
+
+    /// A claim the operator cannot check is not one it should store.
+    #[tokio::test]
+    async fn a_malformed_supersedes_is_refused() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        for value in [json!("not-a-digest"), json!(digest)] {
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&harness.preflight_body(&snapshot, &terms)).unwrap();
+            body["supersedes"] = value.clone();
+            let (status, _) = harness
+                .send("POST", "/v1/preflight", serde_json::to_vec(&body).unwrap())
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "accepted supersedes {value}");
+        }
+    }
+
+    /// A lost grant response must not cost the holder their quota.
+    ///
+    /// Re-preflighting returns the grant they already have rather than
+    /// minting a second one that competes with it — the same
+    /// reconciliation `already_retained` gives the committed case, one
+    /// step earlier.
+    #[tokio::test]
+    async fn a_lost_grant_response_is_recovered_not_duplicated() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let (_, first) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+
+        // The client never saw that response. It asks again.
+        let (status, second) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        assert_eq!(status, StatusCode::OK, "a re-preflight was refused");
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(second["uploadId"], first["uploadId"], "a second grant was minted");
+
+        // And the quota was not spent twice: with a limit of two, a
+        // different snapshot still fits.
+        let other: Vec<u8> = (50..70u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&other, &terms))
+            .await;
+        assert_eq!(status, StatusCode::OK, "the duplicate grant consumed the quota");
+    }
+
+    /// A commit sent one chunk early costs one chunk, not the snapshot.
+    #[tokio::test]
+    async fn an_early_commit_keeps_the_bytes_already_sent() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let (_, grant) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let grant: serde_json::Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+
+        // Chunk 1's response is lost, so the client never sends it and
+        // commits believing it is done.
+        for index in [0usize, 2] {
+            let end = usize::min(index * 8 + 8, snapshot.len());
+            harness
+                .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/{index}"), snapshot[index * 8..end].to_vec())
+                .await;
+        }
+        let (status, body) = harness.send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "upload_incomplete");
+        assert_eq!(error["missingChunks"], json!([1]), "the gap was not named");
+
+        // The grant survives, so recovery is one chunk.
+        let (status, _) = harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/1"), snapshot[8..16].to_vec())
+            .await;
+        assert_eq!(status, StatusCode::OK, "the grant was destroyed by a premature commit");
+        let (status, body) = harness.send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![]).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     }
 }

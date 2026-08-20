@@ -71,9 +71,13 @@ impl Store {
                 chunk_count       INTEGER NOT NULL,
                 received_mask     BLOB NOT NULL,
                 accepted_terms_id TEXT NOT NULL,
+                supersedes        TEXT,
                 started_at        TEXT NOT NULL,
                 expires_at        TEXT NOT NULL
             );
+            -- Resuming a grant needs (holder, digest) to be findable.
+            CREATE INDEX IF NOT EXISTS uploads_by_digest
+                ON uploads (holder_handle, digest);
             CREATE INDEX IF NOT EXISTS uploads_by_holder
                 ON uploads (holder_handle, expires_at);
 
@@ -245,17 +249,19 @@ impl Store {
         chunk_bytes: i64,
         chunk_count: i64,
         accepted_terms_id: &str,
+        supersedes: Option<&str>,
         started_at: &str,
         expires_at: &str,
     ) -> Result<()> {
         self.connection.execute(
             "INSERT INTO uploads (upload_id, holder_handle, operation_id, digest,
                 sealed_byte_size, chunk_bytes, chunk_count, received_mask,
-                accepted_terms_id, started_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'', ?8, ?9, ?10)",
+                accepted_terms_id, supersedes, started_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'', ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 upload_id, handle, operation_id, digest, sealed_byte_size,
-                chunk_bytes, chunk_count, accepted_terms_id, started_at, expires_at
+                chunk_bytes, chunk_count, accepted_terms_id, supersedes,
+                started_at, expires_at
             ],
         )?;
         Ok(())
@@ -264,7 +270,7 @@ impl Store {
     pub fn upload(&self, upload_id: &str) -> Result<Option<UploadRow>> {
         let mut statement = self.connection.prepare(
             "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
-                    chunk_bytes, chunk_count, accepted_terms_id, expires_at
+                    chunk_bytes, chunk_count, accepted_terms_id, supersedes, expires_at
              FROM uploads WHERE upload_id = ?1",
         )?;
         let mut rows = statement.query_map([upload_id], |row| {
@@ -277,7 +283,8 @@ impl Store {
                 chunk_bytes: row.get(5)?,
                 chunk_count: row.get(6)?,
                 accepted_terms_id: row.get(7)?,
-                expires_at: row.get(8)?,
+                supersedes: row.get(8)?,
+                expires_at: row.get(9)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -297,8 +304,8 @@ impl Store {
     pub fn retain(&self, upload: &UploadRow, retained_at: &str) -> Result<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO snapshots (holder_handle, digest, algorithm,
-                sealed_byte_size, chunk_count, accepted_terms_id, retained_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                sealed_byte_size, chunk_count, accepted_terms_id, supersedes, retained_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 upload.holder_handle,
                 upload.digest,
@@ -306,6 +313,7 @@ impl Store {
                 upload.sealed_byte_size,
                 upload.chunk_count,
                 upload.accepted_terms_id,
+                upload.supersedes,
                 retained_at
             ],
         )?;
@@ -349,6 +357,45 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// A grant this holder already holds for this digest, if one is
+    /// still live.
+    ///
+    /// Preflight returns it rather than minting a second. Without this
+    /// a holder whose grant response was lost re-preflights, is told
+    /// `quota_exceeded` by their own orphaned grant, and can do nothing
+    /// but wait for it to expire — the same reconciliation failure
+    /// `already_retained` avoids for the committed case, one step
+    /// earlier.
+    pub fn open_grant_for(
+        &self,
+        handle: &str,
+        digest: &str,
+        now: &str,
+    ) -> Result<Option<UploadRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
+                    chunk_bytes, chunk_count, accepted_terms_id, supersedes, expires_at
+             FROM uploads
+             WHERE holder_handle = ?1 AND digest = ?2 AND expires_at > ?3
+             ORDER BY expires_at DESC",
+        )?;
+        let mut rows = statement.query_map(rusqlite::params![handle, digest, now], |row| {
+            Ok(UploadRow {
+                upload_id: row.get(0)?,
+                holder_handle: row.get(1)?,
+                operation_id: row.get(2)?,
+                digest: row.get(3)?,
+                sealed_byte_size: row.get(4)?,
+                chunk_bytes: row.get(5)?,
+                chunk_count: row.get(6)?,
+                accepted_terms_id: row.get(7)?,
+                supersedes: row.get(8)?,
+                expires_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Upload ids whose grants have run out.
@@ -413,6 +460,7 @@ pub struct UploadRow {
     pub chunk_bytes: i64,
     pub chunk_count: i64,
     pub accepted_terms_id: String,
+    pub supersedes: Option<String>,
     pub expires_at: String,
 }
 

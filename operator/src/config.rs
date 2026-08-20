@@ -135,7 +135,7 @@ impl Config {
                 2 * 1024 * 1024 * 1024,
             )?,
             maximum_retained_snapshots: parse_positive_i64("BACKUP_MAX_SNAPSHOTS", 3)?,
-            chunk_bytes: parse_positive_i64("BACKUP_CHUNK_BYTES", 8 * 1024 * 1024)?,
+            chunk_bytes: chunk_bytes()?,
             upload_expiry_secs: parse_positive_i64("BACKUP_UPLOAD_EXPIRY_SECS", 24 * 3600)?,
             max_skew_secs: parse_positive_i64("BACKUP_MAX_SKEW_SECS", 300)?,
             outcome_retention_secs: parse_positive_i64(
@@ -214,6 +214,26 @@ fn parse_seed(hex_value: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
+/// The transfer chunk size, bounded by what a request body may be.
+///
+/// An operator may raise `BACKUP_CHUNK_BYTES` without editing code —
+/// that is the promise `MAX_CHUNK_BODY_BYTES` exists to keep. Above the
+/// ceiling every non-final chunk would die at the body limit with a
+/// 413, making every grant unfulfillable and the failure look like a
+/// client bug. Refused at boot, where the operator can still read the
+/// reason.
+fn chunk_bytes() -> std::result::Result<i64, String> {
+    let bytes = parse_positive_i64("BACKUP_CHUNK_BYTES", 8 * 1024 * 1024)?;
+    let ceiling = crate::api::MAX_CHUNK_BODY_BYTES as i64;
+    if bytes > ceiling {
+        return Err(format!(
+            "BACKUP_CHUNK_BYTES is {bytes}, above the {ceiling}-byte request body ceiling; \
+             every non-final chunk would be refused at the body limit"
+        ));
+    }
+    Ok(bytes)
+}
+
 fn parse_positive_i64(key: &str, default: i64) -> Result<i64, String> {
     let value: i64 = match env::var(key) {
         Err(_) => return Ok(default),
@@ -284,4 +304,25 @@ pub fn issuer_keys(references: &[String]) -> BTreeMap<String, ed25519_dalek::Ver
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MAX_CHUNK_BODY_BYTES` is a promise that an operator can raise
+    /// `BACKUP_CHUNK_BYTES` without editing code. Above it, every grant
+    /// would be unfulfillable and every non-final chunk would 413.
+    #[test]
+    fn a_chunk_size_above_the_body_ceiling_is_refused_at_boot() {
+        let ceiling = crate::api::MAX_CHUNK_BODY_BYTES;
+        std::env::set_var("BACKUP_CHUNK_BYTES", (ceiling + 1).to_string());
+        let refused = chunk_bytes();
+        std::env::set_var("BACKUP_CHUNK_BYTES", ceiling.to_string());
+        let accepted = chunk_bytes();
+        std::env::remove_var("BACKUP_CHUNK_BYTES");
+
+        assert!(refused.is_err(), "an unfulfillable chunk size was accepted");
+        assert_eq!(accepted.unwrap(), ceiling as i64);
+    }
 }
