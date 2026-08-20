@@ -26,13 +26,26 @@ COPY --from=builder /build/operator/target/release/onym-backup-operator /usr/loc
 # Unprivileged. This process holds other people's sealed archives and
 # has no reason to be able to write anywhere but its own two
 # directories; nothing it serves needs a privileged operation.
+# Named `onym`, not `operator`: Debian's base-passwd ships a system
+# group called `operator` (gid 37), so `useradd --system operator`
+# tries to create a group that already exists and exits 9. Passing
+# `-g operator` would have built, and would have put this process in a
+# distribution group it has no business being in.
+#
+# The group is created explicitly with gid 10001 rather than left to
+# useradd, because the numbers are what matter: the block volume is
+# chowned to 10001:10001 by provision-volume.sh, and a gid allocated
+# from the system range would leave the mounted volume unwritable in a
+# way that only shows up on a real deployment.
+#
 # No home directory: the process writes to /data and /blobs and nowhere
 # else, so creating one would be inventing a third writable path for
 # nothing to use.
-RUN useradd --system --uid 10001 --no-create-home --home-dir /nonexistent operator \
+RUN groupadd --system --gid 10001 onym \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent onym \
     && mkdir -p /data /blobs \
-    && chown operator:operator /data /blobs
-USER operator
+    && chown onym:onym /data /blobs
+USER onym
 
 # Bookkeeping and bytes are separated deliberately. The SQLite store is
 # small and can live on whatever disk the container is given; `/blobs`
