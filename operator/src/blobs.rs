@@ -4,7 +4,7 @@
 //! Layout:
 //!
 //! ```text
-//! <root>/<hh>/<holder-handle>/<digest-hex>/000000.chunk
+//! <root>/<hh>/<holder-handle>/<digest-hex>/<index>.part
 //! <root>/incoming/<upload-id>/<index>.part
 //! ```
 //!
@@ -126,8 +126,14 @@ impl Blobs {
         let _ = std::fs::remove_dir_all(self.incoming_dir(upload_id));
     }
 
-    /// Stream a retained snapshot's bytes back, in index order.
-    pub fn read_snapshot(&self, handle: &str, digest_hex: &str) -> Result<Vec<u8>> {
+    /// The chunk files of a retained snapshot, in index order.
+    ///
+    /// Paths rather than bytes. `digest_of` was streamed because a
+    /// snapshot is routinely hundreds of megabytes; a download has the
+    /// same exposure, so handing back a `Vec<u8>` would have put the
+    /// whole snapshot in memory per concurrent reader and made a few
+    /// downloads enough to exhaust it.
+    pub fn chunk_paths(&self, handle: &str, digest_hex: &str) -> Result<Vec<PathBuf>> {
         let dir = self.snapshot_dir(handle, digest_hex);
         let mut indices: Vec<i64> = std::fs::read_dir(&dir)
             .map_err(|_| Error::RetentionExpired)?
@@ -141,14 +147,47 @@ impl Blobs {
             })
             .collect();
         indices.sort_unstable();
+        Ok(indices
+            .into_iter()
+            .map(|index| dir.join(format!("{index}.part")))
+            .collect())
+    }
 
+    /// Whole-snapshot read, for tests only. Production reads stream —
+    /// see `chunk_paths`.
+    #[cfg(test)]
+    pub fn read_snapshot(&self, handle: &str, digest_hex: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        for index in indices {
-            let bytes = std::fs::read(dir.join(format!("{index}.part")))
-                .map_err(|e| Error::Internal(format!("read snapshot chunk: {e}")))?;
-            out.extend_from_slice(&bytes);
+        for path in self.chunk_paths(handle, digest_hex)? {
+            out.extend_from_slice(
+                &std::fs::read(&path)
+                    .map_err(|e| Error::Internal(format!("read snapshot chunk: {e}")))?,
+            );
         }
         Ok(out)
+    }
+
+    /// Every `<handle>/<digest-hex>` pair with bytes on disk, and every
+    /// upload id under `incoming/`. Used only by the reconciliation
+    /// sweep, which compares them against the bookkeeping.
+    pub fn retained_on_disk(&self) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for shard in read_dir_names(&self.root) {
+            if shard == "incoming" {
+                continue;
+            }
+            let shard_dir = self.root.join(&shard);
+            for handle in read_dir_names(&shard_dir) {
+                for digest in read_dir_names(&shard_dir.join(&handle)) {
+                    found.push((handle.clone(), digest));
+                }
+            }
+        }
+        found
+    }
+
+    pub fn incoming_on_disk(&self) -> Vec<String> {
+        read_dir_names(&self.root.join("incoming"))
     }
 
     pub fn erase(&self, handle: &str, digest_hex: &str) -> Result<()> {
@@ -165,12 +204,24 @@ impl Blobs {
     }
 }
 
+/// Directory entry names, or nothing. A sweep over a root that does not
+/// exist yet is a no-op, not an error.
+fn read_dir_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn blobs() -> (Blobs, tempdir::TempDir) {
-        let dir = tempdir::TempDir::new("onym-blobs").unwrap();
+    fn blobs() -> (Blobs, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
         (Blobs::new(dir.path()), dir)
     }
 

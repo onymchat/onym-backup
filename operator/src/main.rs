@@ -26,6 +26,7 @@ mod documents;
 mod error;
 mod payload;
 mod store;
+mod sweep;
 
 use std::process::exit;
 
@@ -95,6 +96,42 @@ async fn main() {
         store: tokio::sync::Mutex::new(store),
         blobs: blobs::Blobs::new(blob_root),
     });
+
+    // Reconcile before serving, then hourly. Bytes and rows are written
+    // in two steps, so a crash between them leaves one without the
+    // other; this deletes bytes with no row and never invents a row for
+    // bytes it found. It also collects grants that expired, which is
+    // the only bound on `incoming/` that does not depend on clients
+    // finishing what they start.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = match time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                {
+                    Ok(now) => now,
+                    Err(error) => {
+                        tracing::error!(%error, "could not stamp sweep");
+                        return;
+                    }
+                };
+                let swept = {
+                    let store = state.store.lock().await;
+                    sweep::reconcile(&store, &state.blobs, &now)
+                };
+                if swept.expired_grants + swept.orphan_incoming + swept.orphan_snapshots > 0 {
+                    tracing::info!(
+                        expired_grants = swept.expired_grants,
+                        orphan_incoming = swept.orphan_incoming,
+                        orphan_snapshots = swept.orphan_snapshots,
+                        "swept"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,

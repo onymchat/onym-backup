@@ -28,8 +28,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # rustls-tls keeps us off OpenSSL, matching the moderation service's
 # runtime image. Used only to poll the broker's revocation epoch.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Streaming a retained snapshot back chunk by chunk. A download must not
+# be bounded by memory: the whole point of holding hundreds of megabytes
+# is being able to hand them back.
+async-stream = "0.3"
+futures-core = "0.3"
 
 [dev-dependencies]
 # `oneshot` for router tests without binding a port.
 tower = { version = "0.4", features = ["util"] }
-tempdir = "0.3"
+# `tempfile`, not `tempdir` — the latter is unmaintained and pulls in
+# rand 0.4 / fuchsia-cprng.
+tempfile = "3"

@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::api::AppState;
-use crate::auth::{authenticate, Holder};
+use crate::auth::authenticate;
 use crate::error::{Error, Resource, Result};
 
 #[derive(Deserialize)]
@@ -87,7 +87,10 @@ pub async fn preflight(
     if reference.algorithm != crate::documents::DIGEST_SUITE {
         return Err(Error::BadRequest("unsupported digest algorithm".into()));
     }
-    let digest_hex = digest_hex(&reference.digest)?;
+    // Validated for shape here even though preflight has no use for
+    // the hex itself — a reference we would refuse at commit should not
+    // be granted an upload first.
+    digest_hex(&reference.digest)?;
     if reference.sealed_byte_size <= 0 {
         return Err(Error::BadRequest("sealedByteSize must be positive".into()));
     }
@@ -135,8 +138,18 @@ pub async fn preflight(
 
     // (5) Quota. Never resolved by dropping an older snapshot — that is
     // the holder's call, not ours.
+    //
+    // Open grants count. Retained rows alone are a number that has not
+    // moved yet: a holder one below the limit could preflight N
+    // uploads, each seeing the same count, and commit them all. Commit
+    // re-checks and is the authoritative gate; counting grants here is
+    // what keeps the refusal cheap, which is why preflight exists.
+    let now_stamp = now
+        .format(&Rfc3339)
+        .map_err(|e| Error::Internal(e.to_string()))?;
     let (retained, retained_bytes) = store.usage(&holder.handle)?;
-    if retained >= state.config.maximum_retained_snapshots {
+    let committed = retained + store.open_grants(&holder.handle, &now_stamp)?;
+    if committed >= state.config.maximum_retained_snapshots {
         return Err(Error::QuotaExceeded {
             retained_snapshots: retained,
             maximum_retained_snapshots: state.config.maximum_retained_snapshots,
@@ -163,10 +176,9 @@ pub async fn preflight(
         chunk_bytes,
         chunk_count,
         &request.accepted_terms_id,
-        &now.format(&Rfc3339).map_err(|e| Error::Internal(e.to_string()))?,
+        &now_stamp,
         &expires_at,
     )?;
-    let _ = digest_hex;
 
     Ok(axum::Json(UploadGrant {
         upload_id,
@@ -201,6 +213,9 @@ pub async fn put_chunk(
     if upload.holder_handle != holder.handle {
         return Err(Error::NotFound(Resource::Upload));
     }
+    if has_expired(&upload.expires_at, now)? {
+        return Err(Error::UploadExpired);
+    }
     if index < 0 || index >= upload.chunk_count {
         return Err(Error::BadRequest("chunk index outside the grant".into()));
     }
@@ -220,10 +235,16 @@ pub async fn put_chunk(
     Ok(StatusCode::OK.into_response())
 }
 
-/// Finish an upload: count, size, digest, then move into place.
+/// Finish an upload: count, size, digest, quota, then move into place.
 ///
 /// The digest is recomputed over the bytes actually received. A client
 /// asserting a reference is not evidence — the recomputation is.
+///
+/// The store lock is deliberately *not* held across the hashing. It is
+/// one global mutex, so hashing a few hundred megabytes under it would
+/// stall every other holder's request — including the cheap ones — on
+/// the async runtime thread. Blob work runs on the blocking pool, and
+/// the lock is taken only for the bookkeeping either side of it.
 pub async fn commit(
     State(state): State<Arc<AppState>>,
     Path(upload_id): Path<String>,
@@ -231,47 +252,86 @@ pub async fn commit(
     body: Bytes,
 ) -> Result<Response> {
     let now = OffsetDateTime::now_utc();
-    let store = state.store.lock().await;
     let path = format!("/v1/uploads/{upload_id}/commit");
-    let holder = authenticate(&headers, "POST", &path, &body, &state.config, &store, now)?;
 
-    let upload = store
-        .upload(&upload_id)?
-        .ok_or(Error::NotFound(Resource::Upload))?;
-    if upload.holder_handle != holder.handle {
-        return Err(Error::NotFound(Resource::Upload));
-    }
+    let upload = {
+        let store = state.store.lock().await;
+        let holder = authenticate(&headers, "POST", &path, &body, &state.config, &store, now)?;
+        let upload = store
+            .upload(&upload_id)?
+            .ok_or(Error::NotFound(Resource::Upload))?;
+        if upload.holder_handle != holder.handle {
+            return Err(Error::NotFound(Resource::Upload));
+        }
+        if has_expired(&upload.expires_at, now)? {
+            return Err(Error::UploadExpired);
+        }
+        upload
+    };
 
-    let received = state.blobs.received_bytes(&upload_id, upload.chunk_count)?;
+    let received = blocking(&state, {
+        let id = upload_id.clone();
+        let count = upload.chunk_count;
+        move |state| state.blobs.received_bytes(&id, count)
+    })
+    .await?;
     if received != upload.sealed_byte_size {
         // Cheap check first: a truncated upload should not cost a hash
         // of everything that did arrive.
-        state.blobs.discard_upload(&upload_id);
-        store.drop_upload(&upload_id)?;
+        abandon(&state, &upload_id).await?;
         return Err(Error::DigestMismatch);
     }
 
-    let digest = state.blobs.digest_of(&upload_id, upload.chunk_count)?;
+    let digest = blocking(&state, {
+        let id = upload_id.clone();
+        let count = upload.chunk_count;
+        move |state| state.blobs.digest_of(&id, count)
+    })
+    .await?;
     if digest != upload.digest {
-        state.blobs.discard_upload(&upload_id);
-        store.drop_upload(&upload_id)?;
+        abandon(&state, &upload_id).await?;
         return Err(Error::DigestMismatch);
     }
-
     let digest_hex = digest_hex(&digest)?;
-    state.blobs.commit(&upload_id, &holder.handle, &digest_hex)?;
+
     let retained_at = now
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
-    store.retain(&upload, &retained_at)?;
-    store.drop_upload(&upload_id)?;
-    store.record_outcome(
-        &upload.operation_id,
-        &holder.handle,
-        &upload.digest,
-        "retained",
-        &retained_at,
-    )?;
+    {
+        // Quota is re-checked here, under the lock, with the rename
+        // inside it. The preflight check is against a count that had
+        // not moved yet; this one is against the count that decides.
+        // A rename is O(1), not O(bytes), so holding the lock across it
+        // costs nothing and makes check-and-place atomic.
+        let store = state.store.lock().await;
+        let already_held = store.snapshot_exists(&upload.holder_handle, &upload.digest)?;
+        if !already_held {
+            let (retained, retained_bytes) = store.usage(&upload.holder_handle)?;
+            if retained >= state.config.maximum_retained_snapshots {
+                state.blobs.discard_upload(&upload_id);
+                store.drop_upload(&upload_id)?;
+                return Err(Error::QuotaExceeded {
+                    retained_snapshots: retained,
+                    maximum_retained_snapshots: state.config.maximum_retained_snapshots,
+                    retained_bytes,
+                    limit_bytes: state.config.maximum_sealed_snapshot_bytes
+                        * state.config.maximum_retained_snapshots,
+                });
+            }
+        }
+        state
+            .blobs
+            .commit(&upload_id, &upload.holder_handle, &digest_hex)?;
+        store.retain(&upload, &retained_at)?;
+        store.drop_upload(&upload_id)?;
+        store.record_outcome(
+            &upload.operation_id,
+            &upload.holder_handle,
+            &upload.digest,
+            "retained",
+            &retained_at,
+        )?;
+    }
 
     Ok(axum::Json(json!({
         "outcome": {
@@ -287,6 +347,24 @@ pub async fn commit(
         }
     }))
     .into_response())
+}
+
+/// Run blob work on the blocking pool, off the store lock.
+async fn blocking<T, F>(state: &Arc<AppState>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> Result<T> + Send + 'static,
+{
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || work(&state))
+        .await
+        .map_err(|e| Error::Internal(format!("blob task: {e}")))?
+}
+
+/// Give up on an upload: bytes first, then the row.
+async fn abandon(state: &Arc<AppState>, upload_id: &str) -> Result<()> {
+    state.blobs.discard_upload(upload_id);
+    state.store.lock().await.drop_upload(upload_id)
 }
 
 /// Everything this holder's key can enumerate. There is no parameter
@@ -332,24 +410,68 @@ pub async fn download(
     headers: HeaderMap,
 ) -> Result<Response> {
     let now = OffsetDateTime::now_utc();
-    let store = state.store.lock().await;
     let path = format!("/v1/snapshots/{digest_path}");
-    let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
-
     let digest = format!("sha256:{digest_path}");
-    if !store.snapshot_exists(&holder.handle, &digest)? {
-        // Not "this holder cannot see it" versus "it does not exist" —
-        // the same answer either way, because distinguishing them would
-        // tell one holder whether another holds a given digest.
-        return Err(Error::NotFound(Resource::Snapshot));
-    }
-    let bytes = state.blobs.read_snapshot(&holder.handle, &digest_path)?;
+
+    let holder = {
+        let store = state.store.lock().await;
+        let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
+        // Shape-checked as well as looked up. The database lookup would
+        // refuse a malformed digest today because nothing matches it,
+        // but the path segment reaches the filesystem and should not
+        // depend on that for its safety.
+        digest_hex(&digest)?;
+        if !store.snapshot_exists(&holder.handle, &digest)? {
+            // Not "this holder cannot see it" versus "it does not
+            // exist" — the same answer either way, because
+            // distinguishing them would tell one holder whether another
+            // holds a given digest.
+            return Err(Error::NotFound(Resource::Snapshot));
+        }
+        holder
+    };
+
+    // Streamed, not buffered. A snapshot is routinely hundreds of
+    // megabytes; reading one into a `Vec` per concurrent download would
+    // make a handful of readers enough to exhaust memory.
+    let paths = state.blobs.chunk_paths(&holder.handle, &digest_path)?;
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        axum::body::Body::from_stream(snapshot_stream(paths)),
     )
         .into_response())
+}
+
+/// The snapshot's bytes, chunk by chunk, a bounded buffer at a time.
+fn snapshot_stream(
+    paths: Vec<std::path::PathBuf>,
+) -> impl futures_core::Stream<Item = std::io::Result<Bytes>> {
+    async_stream::try_stream! {
+        for path in paths {
+            let mut file = tokio::fs::File::open(&path).await?;
+            let mut buffer = vec![0u8; 256 * 1024];
+            loop {
+                let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                yield Bytes::copy_from_slice(&buffer[..read]);
+            }
+        }
+    }
+}
+
+/// Has a grant run out?
+///
+/// Parsed and compared as instants rather than as strings. Both sides
+/// are RFC 3339 written by us, so a lexicographic compare would almost
+/// always agree — "almost always" is not a property worth relying on
+/// for the check that decides whether bytes are still accepted.
+fn has_expired(expires_at: &str, now: OffsetDateTime) -> Result<bool> {
+    let expiry = OffsetDateTime::parse(expires_at, &Rfc3339)
+        .map_err(|e| Error::Internal(format!("unparseable grant expiry: {e}")))?;
+    Ok(expiry <= now)
 }
 
 /// `sha256:<64 lowercase hex>` → the hex, or a refusal.
@@ -387,12 +509,12 @@ mod tests {
     struct Harness {
         state: Arc<AppState>,
         signing: SigningKey,
-        _dir: tempdir::TempDir,
+        _dir: tempfile::TempDir,
     }
 
     impl Harness {
         fn new(issuers: Vec<String>) -> Harness {
-            let dir = tempdir::TempDir::new("onym-uploads").unwrap();
+            let dir = tempfile::TempDir::new().unwrap();
             let mut config = Config::for_tests("onym:component:test", issuers);
             config.chunk_bytes = 8;
             config.maximum_retained_snapshots = 2;
@@ -408,6 +530,11 @@ mod tests {
                 signing: SigningKey::from_bytes(&[5u8; 32]),
                 _dir: dir,
             }
+        }
+
+        /// The blinded handle the operator knows this holder by.
+        fn handle(&self) -> String {
+            payload::holder_handle(&self.signing.verifying_key())
         }
 
         fn terms_id(&self) -> String {
@@ -624,5 +751,183 @@ mod tests {
         stranger.signing = SigningKey::from_bytes(&[6u8; 32]);
         let (status, _) = stranger.send("GET", &format!("/v1/snapshots/{digest_hex}"), vec![]).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Preflight counts open grants, not just retained rows.
+    ///
+    /// Without this a holder one below the limit could preflight N
+    /// uploads — each seeing the same unmoved count — and commit them
+    /// all, walking straight past the quota.
+    #[tokio::test]
+    async fn open_grants_count_against_the_quota() {
+        let harness = Harness::new(vec![]);
+        let terms = harness.terms_id();
+        // Limit is 2. Two grants, nothing committed yet.
+        for seed in [0u8, 50] {
+            let snapshot: Vec<u8> = (seed..seed + 20).collect();
+            let (status, _) = harness
+                .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let third: Vec<u8> = (100..120u8).collect();
+        let (status, body) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&third, &terms))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "a third grant was issued at a limit of two");
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "quota_exceeded");
+    }
+
+    /// Commit re-checks, and is the gate that actually decides.
+    ///
+    /// Preflight's count is against a number that has not moved yet, so
+    /// commit must not trust it. The sequence here is ordinary rather
+    /// than contrived: a grant is issued while there is room, and the
+    /// operator's limit is lowered before it is committed.
+    #[tokio::test]
+    async fn commit_refuses_a_grant_that_no_longer_fits() {
+        let mut harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let (_, grant) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let grant: serde_json::Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        for index in 0..3usize {
+            let end = usize::min(index * 8 + 8, snapshot.len());
+            harness
+                .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/{index}"), snapshot[index * 8..end].to_vec())
+                .await;
+        }
+
+        // The operator's limit drops to zero — a config change, not a
+        // race, and commit is the only thing standing between the open
+        // grant and a snapshot over the limit.
+        Arc::get_mut(&mut harness.state).unwrap().config.maximum_retained_snapshots = 0;
+
+        let (status, body) = harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "commit accepted a snapshot over the quota");
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "quota_exceeded");
+
+        // And it did not leave the bytes lying around.
+        assert!(harness.state.blobs.incoming_on_disk().is_empty());
+    }
+
+    /// A grant that ran out stops accepting bytes.
+    ///
+    /// `upload_expired`, not `upload_not_found`: the holder was right
+    /// about the upload, they were just too late, and a client told
+    /// "not found" by a row that still exists learns the wrong thing.
+    #[tokio::test]
+    async fn an_expired_grant_accepts_nothing() {
+        let harness = Harness::new(vec![]);
+        let upload_id = "expired-grant";
+        {
+            let store = harness.state.store.lock().await;
+            store
+                .begin_upload(
+                    upload_id,
+                    &harness.handle(),
+                    "op-expired",
+                    "sha256:{}",
+                    8,
+                    8,
+                    1,
+                    &harness.terms_id(),
+                    "2020-01-01T00:00:00Z",
+                    "2020-01-02T00:00:00Z",
+                )
+                .unwrap();
+        }
+        harness.state.blobs.begin_upload(upload_id).unwrap();
+
+        let (status, body) = harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/0"), vec![7u8; 8])
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "an expired grant took a chunk");
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "upload_expired");
+
+        let (status, _) = harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "an expired grant was committed");
+    }
+
+    /// The operation id is chosen by the client, so one holder must not
+    /// be able to pick another's and overwrite the outcome they will
+    /// later reconcile against.
+    #[tokio::test]
+    async fn one_holders_operation_id_does_not_displace_anothers() {
+        let harness = Harness::new(vec![]);
+        let mut stranger = Harness::new(vec![]);
+        stranger.state = harness.state.clone();
+        stranger.signing = SigningKey::from_bytes(&[6u8; 32]);
+
+        let shared_operation = "op-collision";
+        {
+            let store = harness.state.store.lock().await;
+            store
+                .record_outcome(shared_operation, &harness.handle(), "sha256:aa", "retained", "2026-01-01T00:00:00Z")
+                .unwrap();
+            store
+                .record_outcome(shared_operation, &stranger.handle(), "sha256:bb", "retained", "2026-01-02T00:00:00Z")
+                .unwrap();
+
+            // Both rows survive, each under its own holder.
+            let count: i64 = store
+                .connection_for_tests()
+                .query_row("SELECT COUNT(*) FROM operation_outcomes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "one holder's outcome replaced another's");
+            let digest: String = store
+                .connection_for_tests()
+                .query_row(
+                    "SELECT digest FROM operation_outcomes WHERE holder_handle = ?1",
+                    [&harness.handle()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(digest, "sha256:aa");
+        }
+    }
+
+    /// Bigger than one buffer of the download stream, so the response
+    /// is assembled from more than one read and more than one chunk
+    /// file. A `Vec`-returning read would have passed this too — what
+    /// it guards is that streaming did not reorder or drop anything.
+    #[tokio::test]
+    async fn a_multi_chunk_snapshot_streams_back_in_order() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..250u8).cycle().take(4096).collect();
+        let (status, body) = harness.store_snapshot(&snapshot).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let digest_hex = hex::encode(Sha256::digest(&snapshot));
+        let (status, bytes) = harness.send("GET", &format!("/v1/snapshots/{digest_hex}"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes.len(), snapshot.len());
+        assert_eq!(bytes, snapshot, "the streamed bytes came back changed");
+    }
+
+    /// The digest reaches the filesystem as a path segment. The
+    /// database lookup would refuse a malformed one today because
+    /// nothing matches it — that is a reason to validate anyway, not a
+    /// reason to skip it.
+    #[tokio::test]
+    async fn a_malformed_digest_is_refused_before_it_reaches_the_disk() {
+        let harness = Harness::new(vec![]);
+        for segment in ["..", "AAAA", &"f".repeat(63)] {
+            let (status, _) = harness.send("GET", &format!("/v1/snapshots/{segment}"), vec![]).await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+                "{segment} produced {status}"
+            );
+        }
     }
 }

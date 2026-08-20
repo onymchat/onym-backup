@@ -75,6 +75,13 @@ pub enum Error {
         limit_bytes: i64,
     },
 
+    /// The grant ran out. Distinct from `upload_not_found`: the
+    /// upload was real and the holder was right about it, they were
+    /// just too late — and a client that re-preflights on 404 would
+    /// otherwise be told to do so by a row that still exists.
+    #[error("upload expired")]
+    UploadExpired,
+
     /// A chunk index was re-sent with different bytes.
     #[error("chunk mismatch")]
     ChunkMismatch,
@@ -115,6 +122,7 @@ impl Error {
             Error::InvalidEntitlement { .. } => "invalid_entitlement",
             Error::SnapshotTooLarge { .. } => "snapshot_too_large",
             Error::QuotaExceeded { .. } => "quota_exceeded",
+            Error::UploadExpired => "upload_expired",
             Error::ChunkMismatch => "chunk_mismatch",
             Error::DigestMismatch => "digest_mismatch",
             Error::NotFound(Resource::Snapshot) => "snapshot_not_found",
@@ -132,6 +140,7 @@ impl Error {
             Error::SignatureInvalid | Error::InvalidEntitlement { .. } => StatusCode::UNAUTHORIZED,
             Error::TermsChanged { .. }
             | Error::QuotaExceeded { .. }
+            | Error::UploadExpired
             | Error::ChunkMismatch
             | Error::DigestMismatch => StatusCode::CONFLICT,
             Error::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,

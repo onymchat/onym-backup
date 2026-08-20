@@ -82,12 +82,20 @@ impl Store {
             -- is declared: keeping an operation id IS the per-holder
             -- timing trace §15 otherwise forbids, so it is a window
             -- measured in hours rather than an exception.
+            -- Keyed on (holder, operation) rather than operation
+            -- alone. The operation id is chosen by the client, so a
+            -- bare primary key would let one holder pick another's id
+            -- and silently replace their outcome row — breaking the
+            -- reconciliation this table exists to serve. Namespacing it
+            -- per holder makes the id a holder's own business, which is
+            -- what it always was.
             CREATE TABLE IF NOT EXISTS operation_outcomes (
-                operation_id  TEXT PRIMARY KEY,
+                operation_id  TEXT NOT NULL,
                 holder_handle TEXT NOT NULL,
                 digest        TEXT NOT NULL,
                 status        TEXT NOT NULL,
-                recorded_at   TEXT NOT NULL
+                recorded_at   TEXT NOT NULL,
+                PRIMARY KEY (holder_handle, operation_id)
             );
 
             -- Kept because §12 exports them and a holder may need to
@@ -256,7 +264,7 @@ impl Store {
     pub fn upload(&self, upload_id: &str) -> Result<Option<UploadRow>> {
         let mut statement = self.connection.prepare(
             "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
-                    chunk_bytes, chunk_count, accepted_terms_id
+                    chunk_bytes, chunk_count, accepted_terms_id, expires_at
              FROM uploads WHERE upload_id = ?1",
         )?;
         let mut rows = statement.query_map([upload_id], |row| {
@@ -269,6 +277,7 @@ impl Store {
                 chunk_bytes: row.get(5)?,
                 chunk_count: row.get(6)?,
                 accepted_terms_id: row.get(7)?,
+                expires_at: row.get(8)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -322,6 +331,67 @@ impl Store {
         Ok(())
     }
 
+    /// Grants this holder has open and has not let expire.
+    ///
+    /// Counted alongside retained snapshots at preflight. Quota checked
+    /// against retained rows alone is checked against a number that has
+    /// not moved yet: a holder one below the limit could preflight N
+    /// uploads, each seeing the same count, then commit all N. The
+    /// commit-time re-check is the authoritative gate; counting grants
+    /// here is what keeps the refusal *cheap*, which is the entire
+    /// reason preflight exists.
+    pub fn open_grants(&self, handle: &str, now: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM uploads
+                 WHERE holder_handle = ?1 AND expires_at > ?2",
+                rusqlite::params![handle, now],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Upload ids whose grants have run out.
+    pub fn expired_uploads(&self, now: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT upload_id FROM uploads WHERE expires_at <= ?1")?;
+        let rows = statement.query_map([now], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
+    }
+
+    pub fn all_upload_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare("SELECT upload_id FROM uploads")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
+    }
+
+    /// Every live snapshot as `(holder_handle, digest-hex)` — the shape
+    /// the blob layer names them by, so the sweep can compare directly.
+    pub fn all_retained_keys(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT holder_handle, digest FROM snapshots WHERE erased_at IS NULL")?;
+        let rows = statement.query_map([], |row| {
+            let handle: String = row.get(0)?;
+            let digest: String = row.get(1)?;
+            Ok((
+                handle,
+                digest.strip_prefix("sha256:").unwrap_or(&digest).to_string(),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The raw connection, for tests that assert on table shape rather
+    /// than on behaviour — the primary key of `operation_outcomes` is
+    /// not observable through any method, and it is a property worth
+    /// asserting directly.
+    #[cfg(test)]
+    pub fn connection_for_tests(&self) -> &rusqlite::Connection {
+        &self.connection
+    }
+
     pub fn snapshot_exists(&self, handle: &str, digest: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM snapshots
@@ -343,6 +413,7 @@ pub struct UploadRow {
     pub chunk_bytes: i64,
     pub chunk_count: i64,
     pub accepted_terms_id: String,
+    pub expires_at: String,
 }
 
 pub struct RetainedRow {

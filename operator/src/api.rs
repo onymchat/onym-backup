@@ -139,20 +139,26 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn state() -> Arc<AppState> {
+    fn state() -> (Arc<AppState>, tempfile::TempDir) {
+        // A `TempDir` handed back with the state rather than a shared
+        // path under `temp_dir()`: these tests never touch blobs, but a
+        // fixed path shared across runs is the kind of thing that works
+        // until two run at once.
+        let dir = tempfile::TempDir::new().unwrap();
         let config = Config::for_tests("onym:component:test", vec![]);
         let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
         let documents = Documents::build(&config, &signing).unwrap();
-        Arc::new(AppState {
+        (Arc::new(AppState {
             config,
             documents,
             store: tokio::sync::Mutex::new(Store::in_memory().unwrap()),
-            blobs: crate::blobs::Blobs::new(std::env::temp_dir().join("onym-backup-api-tests")),
-        })
+            blobs: crate::blobs::Blobs::new(dir.path()),
+        }), dir)
     }
 
     async fn get_status(path: &str) -> StatusCode {
-        router(state())
+        let (state, _dir) = state();
+        router(state)
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap()
@@ -168,7 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn terms_are_served_at_their_own_digest() {
-        let state = state();
+        let (state, _dir) = state();
         let hex = state.documents.terms.0.strip_prefix("sha256:").unwrap().to_string();
         assert_eq!(get_status(&format!("/terms/{hex}.json")).await, StatusCode::OK);
     }
@@ -178,7 +184,8 @@ mod tests {
     /// caller's snapshot never pinned.
     #[tokio::test]
     async fn unknown_terms_are_not_substituted() {
-        let response = router(state())
+        let (state, _dir) = state();
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .uri(format!("/terms/{}.json", "f".repeat(64)))
@@ -231,7 +238,7 @@ mod tests {
         // so it cannot narrow silently as files are added — a guarantee
         // that quietly stops covering new code is worse than none,
         // because it still reads as covered.
-        let sources: [(&str, &str); 9] = [
+        let sources: [(&str, &str); 10] = [
             ("api", include_str!("api.rs")),
             ("uploads", include_str!("uploads.rs")),
             ("auth", include_str!("auth.rs")),
@@ -241,6 +248,7 @@ mod tests {
             ("error", include_str!("error.rs")),
             ("payload", include_str!("payload.rs")),
             ("store", include_str!("store.rs")),
+            ("sweep", include_str!("sweep.rs")),
         ];
 
         let declared: Vec<String> = include_str!("main.rs")
