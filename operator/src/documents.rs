@@ -202,10 +202,22 @@ fn manifest_document(config: &Config, operator_key: &str, terms_id: &str) -> Val
         // Empty in free mode, and that is the declaration: an operator
         // naming no issuers never asks for an entitlement.
         "entitlementIssuers": config.entitlement_issuers,
-        // Ids only. A price here would be this operator asserting terms
-        // it is not party to (§10.1); what an offer costs belongs to
-        // the frontend's channel agreement.
-        "offers": config.offers,
+        // `ServiceManifest.offers` is an array of **objects**
+        // (WHITEPAPER §16.1), which is what both clients parse — an
+        // array of bare ids decodes lossily to nothing, leaving a
+        // charging operator's manifest declaring no offer at all. The
+        // §10.1 refusal is the one that carries bare ids, and that
+        // asymmetry is in the documents rather than a mistake.
+        //
+        // `model` is `subscription` because that is what this operator
+        // sells: a non-null `quota` is refused, so a consumable offer
+        // is not one it could honour. Still no price, no currency and
+        // no storefront — those belong to the frontend's channel
+        // agreement, not to anything an operator publishes.
+        "offers": config.offers.iter().map(|offer| json!({
+            "offerId": offer,
+            "model": "subscription",
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -392,6 +404,28 @@ mod tests {
     /// case-insensitive order. Today's documents cannot tell the two
     /// apart — every key is lowercase ASCII — so the fixture uses keys
     /// that can.
+    /// The shape both clients parse. `ServiceOffer.decodeLossy` skips
+    /// any element that is not an object carrying `offerId` and
+    /// `model`, so an array of bare ids leaves a charging operator
+    /// declaring no offer at all — and the failure is silent, because
+    /// lossy decoding is not an error.
+    #[test]
+    fn published_offers_are_objects_a_client_can_decode() {
+        let config = Config::for_tests("onym:component:test", vec!["onym:key:aa".into()]);
+        let manifest = manifest_document(&config, "onym:key:bb", "sha256:cc");
+        let offers = manifest["offers"].as_array().unwrap();
+        assert_eq!(offers.len(), config.offers.len());
+        assert_eq!(offers[0]["offerId"], json!(config.offers[0]));
+        assert!(
+            offers[0]["model"].as_str().is_some_and(|m| !m.is_empty()),
+            "an offer without a model decodes to nothing"
+        );
+        // §10.1 still holds: nothing about what it costs.
+        for key in ["price", "currency", "storefront"] {
+            assert!(offers[0].get(key).is_none(), "{key} appeared in an offer");
+        }
+    }
+
     #[test]
     fn canonical_keys_sort_by_utf8_byte_order() {
         let value = json!({ "a": 1, "Z": 2, "\u{10400}": 3, "b": 4 });
