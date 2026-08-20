@@ -943,6 +943,8 @@ mod tests {
             let digest = format!("sha256:{}", hex::encode(Sha256::digest(snapshot)));
             assert!(covered.contains(&digest.as_str()), "{digest} is not named");
         }
+
+        assert_eq!(receipts.as_array().unwrap().len(), 1, "one terms document, one receipt");
     }
 
     /// §9.6 justifies the client-chosen operationId by saying a lost
@@ -1037,5 +1039,135 @@ mod tests {
         let (status, body) = erase(&other, "all").await;
         assert_eq!(status, StatusCode::OK, "a live receipt was reported as expired");
         assert_eq!(body[0]["receiptId"], json!(first_id));
+    }
+
+    /// §9.6 justifies the client-chosen operationId by saying a lost
+    /// erase response must not cost the holder their receipt. That
+    /// stops being true the moment the outcome is swept on the short
+    /// upload window — the holder would be left holding a receiptId
+    /// they can no longer learn. Erase outcomes ride the receipt
+    /// window instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erase_outcome_outlives_the_upload_outcome_window() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase_as(&harness, &digest, "op-erase-window").await;
+
+        // Every upload outcome is past its window; no receipt is.
+        tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            )
+        });
+
+        let (status, body) = harness
+            .send("GET", "/v1/operations/op-erase-window", vec![])
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the erase outcome was swept on the upload window"
+        );
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        let id = outcome["outcome"]["receiptIds"][0].as_str().unwrap();
+        let (status, _) = harness
+            .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A scope that was never held is a 404 — the one empty-scope case
+    /// that is not a replay. Three distinct answers, and a client that
+    /// conflated them would retry an erasure that can never succeed.
+    #[tokio::test]
+    async fn the_three_empty_scope_answers_are_distinct() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let held = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        let never = format!("sha256:{}", "cc".repeat(32));
+
+        // Never held.
+        let (status, _) = erase(&harness, &never).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "never held");
+
+        // Erased, receipt live.
+        erase(&harness, &held).await;
+        let (status, _) = erase(&harness, &held).await;
+        assert_eq!(status, StatusCode::OK, "erased with a live receipt");
+    }
+
+    /// One request is acknowledged at one moment.
+    ///
+    /// Replay groups by `acknowledgedAt`, so an operator stamping each
+    /// receipt as it signs it would split one erasure across two
+    /// timestamps and replay a subset of its own commitment. This needs
+    /// a scope spanning *two* pinned terms documents to mean anything —
+    /// with one, the set is trivially of size one and the assertion
+    /// cannot fail, which is what the first version of it did.
+    #[tokio::test]
+    async fn one_erasure_is_acknowledged_at_one_moment() {
+        let harness = Harness::new(vec![]);
+        let first: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&first).await;
+
+        // A second snapshot pinned to superseded terms, which is the
+        // only way a scope spans two terms documents.
+        let older = br#"{"termsVersion":1,"erasure":{"scope":"the primary copy","excluded":"copies held by other participants","completionDeadline":"P3D"}}"#;
+        let older_id = crate::documents::digest(older);
+        {
+            let store = harness.state.store.lock().await;
+            store
+                .remember_terms(&older_id, older, b"c2ln", "2026-01-01T00:00:00Z")
+                .unwrap();
+            store
+                .retain(
+                    &crate::store::UploadRow {
+                        upload_id: "u-old".into(),
+                        holder_handle: harness.handle(),
+                        operation_id: "op-old".into(),
+                        digest: format!("sha256:{}", "ab".repeat(32)),
+                        sealed_byte_size: 8,
+                        chunk_bytes: 8,
+                        chunk_count: 1,
+                        accepted_terms_id: older_id.clone(),
+                        supersedes: None,
+                        expires_at: "2999-01-01T00:00:00Z".into(),
+                    },
+                    "2026-01-02T00:00:00Z",
+                )
+                .unwrap();
+        }
+
+        let (status, receipts) = erase(&harness, "all").await;
+        assert_eq!(status, StatusCode::OK);
+        let receipts = receipts.as_array().unwrap();
+        assert_eq!(receipts.len(), 2, "two pinned terms should yield two receipts");
+
+        let stamps: std::collections::HashSet<&str> = receipts
+            .iter()
+            .map(|r| r["acknowledgedAt"].as_str().unwrap())
+            .collect();
+        assert_eq!(stamps.len(), 1, "one erasure produced two acknowledgedAt values");
+
+        // And each cites its own pinned terms, not whichever were
+        // current — the whole reason there are two.
+        let cited: std::collections::HashSet<&str> = receipts
+            .iter()
+            .map(|r| r["termsId"].as_str().unwrap())
+            .collect();
+        assert!(cited.contains(older_id.as_str()), "superseded terms were not cited");
+        assert!(cited.contains(harness.terms_id().as_str()));
+
+        // Replay returns both, since they share an acknowledgedAt.
+        let (_, replay) = erase(&harness, "all").await;
+        assert_eq!(replay.as_array().unwrap().len(), 2, "replay dropped half the erasure");
     }
 }

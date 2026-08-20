@@ -689,15 +689,27 @@ impl Store {
         Ok(count > 0)
     }
 
-    /// Drop outcome records past the declared window.
+    /// Drop outcome records past their declared window.
     ///
-    /// The window is short on purpose: keeping an operation id is the
-    /// per-holder timing trace §15 otherwise forbids, so it is a
+    /// The upload window is short on purpose: keeping an operation id
+    /// is the per-holder timing trace §15 otherwise forbids, so it is a
     /// declared few hours rather than an exception.
-    pub fn sweep_outcomes(&self, older_than: &str) -> Result<usize> {
+    ///
+    /// **Erase outcomes are bounded by the receipt window instead.**
+    /// They name `receiptIds`, and §9.6 justifies the client-chosen
+    /// `operationId` by saying a lost erase response must not cost the
+    /// holder their receipt — which stops being true the moment the
+    /// outcome is swept, leaving them holding a receipt id they can no
+    /// longer learn. The asymmetry costs no privacy: the receipt rows
+    /// those ids point at are retained exactly that long anyway, and
+    /// each already carries its scope and coverage, so the outcome
+    /// beside them discloses nothing new.
+    pub fn sweep_outcomes(&self, uploads_before: &str, erasures_before: &str) -> Result<usize> {
         Ok(self.connection.execute(
-            "DELETE FROM operation_outcomes WHERE recorded_at < ?1",
-            [older_than],
+            "DELETE FROM operation_outcomes
+             WHERE (status <> 'erased' AND recorded_at < ?1)
+                OR (status =  'erased' AND recorded_at < ?2)",
+            rusqlite::params![uploads_before, erasures_before],
         )?)
     }
 

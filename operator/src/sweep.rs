@@ -151,7 +151,7 @@ pub fn reconcile(
     // A `404` afterwards is not evidence the operation failed — the
     // client reconciles by reference instead — which is what makes a
     // short window affordable.
-    match store.blocking_lock().sweep_outcomes(outcome_floor) {
+    match store.blocking_lock().sweep_outcomes(outcome_floor, receipt_floor) {
         Ok(count) => swept.aged_outcomes = count,
         Err(error) => tracing::warn!(%error, "could not sweep outcomes"),
     }

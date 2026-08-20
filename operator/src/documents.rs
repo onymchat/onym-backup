@@ -282,12 +282,16 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             "operationOutcomes": "PT6H",
             "erasureReceipts": "P1Y",
             "entitlementRecords": "to expiry plus one revocation-epoch interval",
-            // Bounded at the grant's own expiry, and the bound is the
-            // point: an operator that kept expired grants in order to
-            // answer `upload_expired` rather than `upload_not_found`
-            // would be keeping a list of digests a holder started
-            // uploading and abandoned.
-            "uploadGrants": "to the grant's expiresAt",
+            // How long the grant *record* outlives `expiresAt` — not
+            // how long a grant lives. The partial bytes are never kept
+            // past `expiresAt`. This declares the sweep interval
+            // honestly rather than claiming PT0S: the record is
+            // collected on a timer, so it can answer `upload_expired`
+            // for up to that long before becoming
+            // `upload_not_found`. Declaring zero and then holding it
+            // for an hour would be the comfortable answer rather than
+            // the true one.
+            "uploadGrants": "PT1H",
         },
     })
 }
