@@ -102,6 +102,32 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   `receipt_not_found`, `receipt_expired`.
 - A reconciliation sweep: orphaned bytes, expired grants, spent replay nonces,
   aged outcomes, receipts and erased references.
+- `lapseState` in `metadataRetention`, and the four-field record it
+  declares: the holder handle, when they lapsed, when the last window
+  their snapshots' own terms promised ends, and what happens after it.
+  Not the `entitlementId`, not the `offerId`, not the issuer, not the
+  offer, not the credential bytes — a credential retained for six weeks
+  is the per-holder payment diary §15 exists to prevent, where "this
+  holder lapsed at T, grace ends at G, then erase" says nothing about
+  what they bought or from whom. It is written only for a holder with a
+  snapshot to protect and discarded once the window has closed and the
+  post-grace action has been taken. **This field is an extension beyond
+  §15's table**, which has no class for post-lapse lifecycle state at
+  all — [onym-system#41][gap] raises that gap — and the declaration says
+  so rather than implying the profile already covers it.
+
+  The row is written for a holder the operator can still see has
+  lapsed, and also for one it can only infer: a snapshot committed on a
+  grant that outlived the records — which §9.2 explicitly allows, since
+  commit is ungated — leaves bytes with no horizon in either direction,
+  and the sweep adopts that holder with the clock started at first
+  observation. The true instant went with the record and cannot be
+  recovered; starting it late can only grant more notice and grace than
+  was owed. **Charging operators only.** On a free operator every
+  holder has snapshots and no entitlement record, so the same rule
+  ungated would lapse all of them.
+
+[gap]: https://github.com/onymchat/onym-system/issues/41
 - `erasedReferences` in `metadataRetention`, bounding what is remembered about a
   snapshot after its bytes are gone. `list` reports `erased` and a re-erase
   answers `receipt_expired` only while it survives; past it both become "unknown
@@ -126,11 +152,41 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   grace, closing the download and erase their terms promised for another
   six weeks, and `post_grace_due` then returned empty forever, so the
   snapshot was never expired and the bytes were held indefinitely. The
-  record now survives until expiry plus the longest notice-and-grace
-  this operator has published plus one revocation-epoch interval — the
-  point at which every window it could open has closed and the sweep has
-  acted on it — and `metadataRetention.entitlementRecords` declares
-  exactly that, so §18.24 checks the operator against what it holds.
+  horizon now outlives the record instead of the record outliving its
+  bound — see `lapseState` under Added. Records themselves go at §15's
+  bound, `expiresAt` plus one revocation-epoch interval, **per record
+  rather than per holder**: an expired prior credential is collected
+  whether or not its holder has since renewed. Bounding it per holder
+  instead would mean an ordinary subscriber accumulating every
+  credential they had ever held — `raw` bytes, `entitlementId` and
+  `offerId` — for as long as they kept paying, which is the per-holder
+  payment diary §15 exists to prevent, reached by only ever sweeping
+  the holders who had stopped.
+- **A lapsed holder with nothing retained now reads `Unpaid` rather
+  than `Lapsed`**, from about fifteen minutes after expiry instead of
+  weeks. Both refuse with `payment_required` and both name the same
+  offers, so the distinction only reaches a person if a client words
+  the two differently. It follows from holding the record to §15's
+  bound: once it is gone, and there is no snapshot to have written
+  lifecycle state for, the operator genuinely cannot tell "never paid"
+  from "paid once, kept nothing".
+- **`metadataRetention.entitlementRecords` is a duration** (`PT15M` by
+  default), read as a window past `expiresAt` the way §15 reads the
+  column and `uploadGrants` already declares it. It was prose, and both
+  clients compare these numerically and fail closed on anything they
+  cannot parse — so a prose value in a duration column reads as a
+  regression however honest the sentence is.
+- **A revoked renewal's `expiresAt` was discarded.** The store computed
+  the latest unrevoked expiry and the latest expiry overall, then
+  returned the unrevoked one whenever it existed — so a holder with an
+  unrevoked credential expiring at t1 and a refunded renewal expiring at
+  t2 later than t1 had grace and post-grace expiry run from t1, and
+  every snapshot expired up to `t2 - t1` early. The two are now separate
+  answers to separate questions: access is the latest *unrevoked*
+  expiry, so revocation still blocks new paid work immediately, while
+  the lifecycle horizon is the latest expiry across *all* records,
+  because a refunded credential's declared `expiresAt` still governs
+  what the snapshots accepted under it were promised.
 - **`expiresAt` was exclusive.** A credential was refused at the exact
   instant it expired, where §10.4 specifies `notBefore <= now <=
   expiresAt`. One instant, but the same field starts the lapse clock, so
@@ -187,12 +243,18 @@ purchased balance and never decrementing it would be claiming to honour
 terms it has not implemented; the columns are in the schema and unused
 until a broker actually issues consumables.
 
-**There is no `lapse_state` table**, and earlier schemas that created
-one now drop it. Lapse is derived — from the newest unrevoked
-entitlement's expiry, then per snapshot from its own pinned terms. A
-cached copy would be a per-holder payment record that nothing reads,
-that §15 would have to declare, and that can only ever disagree with the
-derivation.
+**The `lapse_state` table is back, and the note that said it never
+would be was wrong.** That note argued lapse is derived — from the
+newest unrevoked entitlement's expiry, then per snapshot from its own
+pinned terms — so a cached copy would be a per-holder payment record
+nothing reads. The argument assumed the entitlement record would still
+be there to derive from, and §15 bounds that record at `expiresAt` plus
+one revocation-epoch interval while the window it opens runs for weeks.
+The real choice was never "derive or cache"; it was "keep the whole
+credential for six weeks, or keep four fields". The table is genuinely
+read now — once the record ages out it is the only thing left to read —
+and the per-snapshot derivation from pinned terms is unchanged, because
+`lapsed_at` is a timestamp and not a decision.
 
 Two changes are deliberately *not* here because they are not observable: the
 store lock is no longer held across hashing, streaming or unlinking, and

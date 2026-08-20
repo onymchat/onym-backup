@@ -364,24 +364,51 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             "holderIdentifiers": "while any snapshot, receipt, erased reference, or live grant is held",
             "operationOutcomes": iso_duration(config.outcome_retention_secs),
             "erasureReceipts": iso_duration(config.receipt_retention_secs),
-            // Longer than §15's table suggests, and deliberately: the
-            // record is what lapse is derived from. Its `expiresAt` is
-            // the moment the holder lapsed, and both the grace window
-            // above and the post-grace expiry are computed from it, so
-            // a record discarded at expiry plus a poll interval would
-            // end this document's own `notice` plus `grace` early and
-            // leave nothing to expire the snapshot from afterwards.
+            // §15's table, verbatim: "to `expiresAt` plus one
+            // revocation-epoch interval". Declared as a bare duration
+            // *past `expiresAt`*, which is how §15 reads this column
+            // and exactly the convention `uploadGrants` below already
+            // follows — the value is a window past the record's own
+            // deadline, not a window from now.
             //
-            // §15's rule is that records are declared rather than
-            // wished away, and §18.24 checks the operator against its
-            // declaration rather than against the table, so the honest
-            // move is to say the window that is actually held. It is
-            // the longest published notice-and-grace because a snapshot
-            // keeps the terms it was accepted under, which may not be
-            // these.
-            "entitlementRecords":
-                "to expiry, plus the longest notice-and-grace this operator has published, \
-                 plus one revocation-epoch interval",
+            // A duration rather than the prose this used to carry,
+            // because both clients compare these numerically and fail
+            // closed on anything they cannot parse: an unparseable
+            // declaration reads as a regression whatever it says, so
+            // prose in a duration column buys a sentence and costs the
+            // comparison the column exists for.
+            //
+            // **This declared more, once.** The record is what lapse is
+            // derived from, so an earlier version held it for the
+            // longest notice-and-grace this operator had published and
+            // widened this string to match. The problem was real; the
+            // remedy was not. §15's bound is normative and a
+            // self-declaration cannot authorize exceeding it — §18.24
+            // asks what an operator holds, and a field saying "I keep
+            // your credential for six weeks" satisfies nothing by
+            // saying it. What outlives the record now is `lapseState`
+            // below, which is four fields rather than a purchase.
+            "entitlementRecords": iso_duration(config.revocation_poll_secs as i64),
+            // **An extension beyond §15's table**, which has no class
+            // for post-lapse lifecycle state at all — onymchat/
+            // onym-system#41 raises that gap. Until it closes, this
+            // field is this operator's own declaration and not
+            // something the profile already covers. Saying so here
+            // rather than filing it under `entitlementRecords` is the
+            // difference between disclosing a record and implying the
+            // profile blessed it.
+            //
+            // What is held: the holder handle, the moment they lapsed,
+            // the end of the last window their snapshots' own terms
+            // promised, and what happens after it. Not the
+            // `entitlementId`, not the `offerId`, not the issuer, not
+            // the offer, not the credential. §10.3 cannot be honoured
+            // without the first four and discloses nothing about a
+            // purchase; the rest would be a payment diary.
+            "lapseState":
+                "while a lapsed holder still has a snapshot inside the notice-and-grace its own \
+                 terms promised, and until the post-grace action those terms declare has been \
+                 taken; then discarded",
             // How long the grant *record* outlives `expiresAt` — not
             // how long a grant lives. The partial bytes are never kept
             // past `expiresAt`. This declares the sweep interval
@@ -514,6 +541,35 @@ mod tests {
                       "erasureReceipts", "entitlementRecords"] {
             assert!(terms["metadataRetention"][class].is_string(), "{class} is not declared");
         }
+    }
+
+    /// §15's table bounds an entitlement record at `expiresAt` plus one
+    /// revocation-epoch interval, and that bound is normative. A
+    /// declaration cannot buy room past it — the operator holds less
+    /// instead, and what outlives the record is declared separately
+    /// because §15 has no class for it.
+    #[test]
+    fn the_entitlement_declaration_does_not_outrun_the_table() {
+        let (documents, _) = documents();
+        let terms: Value = serde_json::from_slice(&documents.terms.1).unwrap();
+        let retention = &terms["metadataRetention"];
+
+        // One revocation-epoch interval past `expiresAt`, and nothing
+        // else. Parseable, because a client that cannot read a duration
+        // column treats it as a regression however honest the prose.
+        let records = retention["entitlementRecords"].as_str().unwrap();
+        assert_eq!(records, "PT15M");
+        assert_eq!(
+            duration_seconds(records),
+            Some(config().revocation_poll_secs as i64),
+            "the declared bound is not one revocation-epoch interval"
+        );
+
+        // Declared, and declared as its own thing. Folding it into
+        // `entitlementRecords` would be the same overreach wearing a
+        // different label.
+        let lapse = retention["lapseState"].as_str().unwrap();
+        assert!(lapse.contains("post-grace"), "the lapse-state bound says nothing about its end");
     }
 
     #[test]
