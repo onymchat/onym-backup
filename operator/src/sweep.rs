@@ -148,24 +148,19 @@ pub fn reconcile(
         Err(error) => tracing::warn!(%error, "could not sweep nonces"),
     }
 
-    // (5) Outcome records past the declared window. Keeping an
-    // operation id is the per-holder timing trace §15 otherwise
-    // forbids, so the window is short and something has to enforce it.
-    // A `404` afterwards is not evidence the operation failed — the
-    // client reconciles by reference instead — which is what makes a
-    // short window affordable.
-    match store.blocking_lock().sweep_outcomes(outcome_floor, receipt_floor) {
-        Ok(count) => swept.aged_outcomes = count,
-        Err(error) => tracing::warn!(%error, "could not sweep outcomes"),
-    }
-
-    // (6) Receipts past `erasureReceipts`. A declared window that
-    // nothing enforces is a window in name only — and once the last
-    // receipt for a scope is gone, §9.6 answers `receipt_expired`
-    // rather than pretending the erasure never happened.
-    match store.blocking_lock().sweep_receipts(receipt_floor) {
-        Ok(count) => swept.aged_receipts = count,
-        Err(error) => tracing::warn!(%error, "could not sweep receipts"),
+    // (5–6) Outcomes, receipts, and receipt coverage. Upload outcomes
+    // use the short declared window; erase outcomes use the receipt
+    // window. The latter and the receipts they name cross their bound
+    // atomically, as do receipt rows and their coverage.
+    let metadata = store
+        .blocking_lock()
+        .sweep_outcomes_and_receipts(outcome_floor, receipt_floor);
+    match metadata {
+        Ok((outcomes, receipts)) => {
+            swept.aged_outcomes = outcomes;
+            swept.aged_receipts = receipts;
+        }
+        Err(error) => tracing::warn!(%error, "could not sweep outcomes and receipts"),
     }
 
     // (7) Erased references past their window. Every promise that

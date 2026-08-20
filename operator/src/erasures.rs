@@ -60,12 +60,10 @@ pub async fn erase(
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
 
-    let mut receipts = Vec::new();
     // Filled inside the locked section, used after it: the bytes are
     // unlinked once the bookkeeping has committed.
-    let mut doomed_hex: Vec<String> = Vec::new();
-    let mut who = String::new();
-    {
+    let (receipts, who, doomed_hex) = {
+        let mut receipts = Vec::new();
         let mut store = state.store.lock().await;
         let holder = authenticate(
             &headers,
@@ -87,11 +85,17 @@ pub async fn erase(
 
         let targets = store.snapshots_in_scope(&holder.handle, &request.scope)?;
         if targets.is_empty() {
-            // Nothing live in scope. If this scope was erased before,
-            // the holder is retrying and is owed the receipt they
-            // already earned — a 404 here would be the same silence
-            // `list` avoids by reporting `erased`.
-            let existing = store.receipts_for_scope(&holder.handle, &request.scope)?;
+            // Nothing live in scope. If these references were erased
+            // before, the holder is owed the newest receipt set that
+            // covers them. Scope equality alone is insufficient: the
+            // same digest may have been uploaded again and erased later
+            // under `all`, making an older exact-scope receipt stale.
+            let erased = store.erased_digests(&holder.handle, &request.scope)?;
+            let existing = store.latest_receipts_for_erased_scope(
+                &holder.handle,
+                &request.scope,
+                &erased,
+            )?;
             if !existing.is_empty() {
                 let ids: Vec<&str> = existing.iter().map(|(id, _)| id.as_str()).collect();
                 // The retry's own operation id is recorded too, so a
@@ -107,25 +111,6 @@ pub async fn erase(
                     &stamp,
                 )?;
                 return Ok(axum::Json(decode_receipts(existing)?).into_response());
-            }
-            // Nothing under this exact scope string — but a receipt
-            // minted for `all` covers digests a later single-digest
-            // retry names directly, and vice versa. Matching on the
-            // string alone would tell that holder their evidence aged
-            // out while it sat fetchable by id.
-            let erased = store.erased_digests(&holder.handle, &request.scope)?;
-            let covering = store.receipts_covering(&holder.handle, &erased)?;
-            if !covering.is_empty() {
-                let ids: Vec<&str> = covering.iter().map(|(id, _)| id.as_str()).collect();
-                store.record_outcome(
-                    &request.operation_id,
-                    &holder.handle,
-                    &request.scope,
-                    "erased",
-                    Some(serde_json::to_string(&ids).unwrap_or_default()),
-                    &stamp,
-                )?;
-                return Ok(axum::Json(decode_receipts(covering)?).into_response());
             }
             // Erased, and no receipt survives. The snapshot rows
             // outlive the receipts, so the operator knows this happened
@@ -194,12 +179,13 @@ pub async fn erase(
             &stamp,
         )?;
 
-        who = holder.handle.clone();
-        doomed_hex = targets
+        let who = holder.handle.clone();
+        let doomed_hex = targets
             .iter()
             .map(|row| crate::uploads::digest_hex(&row.digest))
             .collect::<Result<Vec<_>>>()?;
-    }
+        (receipts, who, doomed_hex)
+    };
 
     // Bytes last, and deliberately. A crash here leaves rows marked
     // erased with their bytes still on disk, which the sweep collects
@@ -1312,5 +1298,29 @@ mod tests {
         let (status, body) = erase(&harness, &digest).await;
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(body["error"], "receipt_expired");
+    }
+
+    #[tokio::test]
+    async fn replay_uses_the_latest_covering_erasure_not_an_older_exact_scope() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        let (_, first) = erase(&harness, &digest).await;
+        let first_id = first[0]["receiptId"].as_str().unwrap().to_string();
+
+        harness.store_snapshot(&snapshot).await;
+        let (_, latest) = erase(&harness, "all").await;
+        let latest_id = latest[0]["receiptId"].as_str().unwrap().to_string();
+        assert_ne!(first_id, latest_id);
+
+        let (status, replay) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            replay[0]["receiptId"],
+            json!(latest_id),
+            "replay returned an older exact-scope receipt"
+        );
     }
 }

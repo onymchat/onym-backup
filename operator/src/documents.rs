@@ -243,6 +243,18 @@ pub fn sign_receipt(receipt: Value, signing: &SigningKey) -> Result<(Value, Vec<
 /// `accessLogs` is `none` because §15 forbids the table, `excluded`
 /// names what erasure cannot reach, and `afterGrace` says what actually
 /// happens rather than the comfortable answer.
+fn iso_duration(seconds: i64) -> String {
+    if seconds % (24 * 60 * 60) == 0 {
+        format!("P{}D", seconds / (24 * 60 * 60))
+    } else if seconds % (60 * 60) == 0 {
+        format!("PT{}H", seconds / (60 * 60))
+    } else if seconds % 60 == 0 {
+        format!("PT{}M", seconds / 60)
+    } else {
+        format!("PT{seconds}S")
+    }
+}
+
 fn default_terms(config: &Config, operator_key: &str) -> Value {
     json!({
         "termsVersion": 1,
@@ -278,9 +290,9 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
         "metadataRetention": {
             "accessLogs": "none",
             "sizeAndTiming": "while the snapshot is retained",
-            "holderIdentifiers": "while any snapshot or receipt is held",
-            "operationOutcomes": "PT6H",
-            "erasureReceipts": "P1Y",
+            "holderIdentifiers": "while any snapshot, receipt, erased reference, or live grant is held",
+            "operationOutcomes": iso_duration(config.outcome_retention_secs),
+            "erasureReceipts": iso_duration(config.receipt_retention_secs),
             "entitlementRecords": "to expiry plus one revocation-epoch interval",
             // How long the grant *record* outlives `expiresAt` — not
             // how long a grant lives. The partial bytes are never kept
@@ -297,7 +309,7 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             // outlive the bytes or an erasure is indistinguishable from
             // a snapshot never stored — and it is bounded for the same
             // reason it exists.
-            "erasedReferences": "P1Y",
+            "erasedReferences": iso_duration(config.erased_reference_retention_secs),
         },
     })
 }
@@ -392,6 +404,26 @@ mod tests {
                       "erasureReceipts", "entitlementRecords"] {
             assert!(terms["metadataRetention"][class].is_string(), "{class} is not declared");
         }
+    }
+
+    #[test]
+    fn terms_declare_the_configured_retention_windows() {
+        let mut config = config();
+        config.outcome_retention_secs = 90;
+        config.receipt_retention_secs = 2 * 24 * 60 * 60;
+        config.erased_reference_retention_secs = 3601;
+        let signing = SigningKey::from_bytes(&config.signing_seed);
+        let documents = Documents::build(&config, &signing).unwrap();
+        let terms: Value = serde_json::from_slice(&documents.terms.1).unwrap();
+        let retention = &terms["metadataRetention"];
+
+        assert_eq!(retention["operationOutcomes"], "PT90S");
+        assert_eq!(retention["erasureReceipts"], "P2D");
+        assert_eq!(retention["erasedReferences"], "PT3601S");
+        assert_eq!(
+            retention["holderIdentifiers"],
+            "while any snapshot, receipt, erased reference, or live grant is held"
+        );
     }
 
     /// Erasure must name what it does not reach. An empty exclusion is

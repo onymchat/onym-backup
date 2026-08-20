@@ -1,19 +1,21 @@
 //! SQLite bookkeeping. The bytes live on the filesystem; this holds
 //! what the operator is allowed to know about them.
 //!
-//! `migrate()` is CREATE-IF-NOT-EXISTS plus an explicit ALTER list —
-//! the shape `onym-moderation` uses. The ALTER list is empty at first
-//! release and exists anyway, because adding a column later without a
-//! place to put it is how a store ends up wiped in the field.
+//! `migrate()` is CREATE-IF-NOT-EXISTS plus explicit, idempotent
+//! migrations. Schema changes preserve the previous release's rows;
+//! startup must never depend on an operator discarding its store.
 //!
 //! **There is no `access_log` table, and that absence is a design
 //! commitment** (§8.3, §15). A per-holder record of who fetched what
 //! and when is exactly the metadata diary this seat exists without. An
 //! operator adding one has changed what it is.
 
-use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 
-use crate::error::Result;
+use rusqlite::Connection;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+use crate::error::{Error, Result};
 
 pub struct Store {
     connection: Connection,
@@ -205,22 +207,52 @@ impl Store {
             "#,
         )?;
 
-        // Added columns go here, one tuple each. Empty at first release
-        // and deliberately present: SQLite has no IF NOT EXISTS for
-        // ADD COLUMN, so without a place to express this, the tempting
-        // alternative is dropping the table.
-        let additions: [(&str, &str, &str); 0] = [];
-        for (table, column, definition) in additions {
-            let already = self
-                .connection
-                .prepare(&format!("PRAGMA table_info({table})"))?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .filter_map(std::result::Result::ok)
-                .any(|existing| existing == column);
-            if !already {
-                self.connection
-                    .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
-            }
+        self.migrate_operation_outcomes()?;
+        Ok(())
+    }
+
+    /// `main` called an outcome's subject `digest` and had no place
+    /// to record erasure receipt ids. Renaming a NOT NULL column cannot
+    /// be expressed as a pair of ADD COLUMNs: old inserts would still
+    /// owe `digest`, and new reads need `subject`. Rebuild the table
+    /// transactionally and copy every existing outcome.
+    fn migrate_operation_outcomes(&self) -> Result<()> {
+        let columns: Vec<String> = self
+            .connection
+            .prepare("PRAGMA table_info(operation_outcomes)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        let has_subject = columns.iter().any(|column| column == "subject");
+        let has_digest = columns.iter().any(|column| column == "digest");
+        let has_receipt_ids = columns.iter().any(|column| column == "receipt_ids");
+
+        if !has_subject && has_digest {
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                r#"
+                CREATE TABLE operation_outcomes_v2 (
+                    operation_id  TEXT NOT NULL,
+                    holder_handle TEXT NOT NULL,
+                    subject       TEXT NOT NULL,
+                    status        TEXT NOT NULL,
+                    receipt_ids   TEXT,
+                    recorded_at   TEXT NOT NULL,
+                    PRIMARY KEY (holder_handle, operation_id)
+                );
+                INSERT INTO operation_outcomes_v2
+                    (operation_id, holder_handle, subject, status, receipt_ids, recorded_at)
+                SELECT operation_id, holder_handle, digest, status, NULL, recorded_at
+                  FROM operation_outcomes;
+                DROP TABLE operation_outcomes;
+                ALTER TABLE operation_outcomes_v2 RENAME TO operation_outcomes;
+                "#,
+            )?;
+            transaction.commit()?;
+        } else if has_subject && !has_receipt_ids {
+            // Supports development stores created after the rename but
+            // before erase outcomes gained receipt ids.
+            self.connection
+                .execute("ALTER TABLE operation_outcomes ADD COLUMN receipt_ids TEXT", [])?;
         }
         Ok(())
     }
@@ -586,41 +618,66 @@ impl Store {
         Ok(())
     }
 
-    /// Live receipts covering any of these references, whatever scope
-    /// string they were issued under.
+    /// The newest live receipt set relevant to this erased scope.
     ///
-    /// The honest answer to "was this erased, and is the evidence still
-    /// here?" — which scope-string equality cannot give, because a
-    /// receipt minted for `all` covers digests a later single-digest
-    /// retry names directly.
-    pub fn receipts_covering(
+    /// Both the original scope and stored coverage matter. A digest can
+    /// be erased, uploaded again, and later covered by `all`; replaying
+    /// the older exact-scope receipt would describe the wrong storage
+    /// lifecycle. Conversely, a receipt minted for one digest is still
+    /// relevant when a later retry names `all`.
+    ///
+    /// One erasure can mint several receipts for distinct pinned terms,
+    /// so recency is selected by `issued_at` and every receipt sharing
+    /// that timestamp is returned as one set.
+    pub fn latest_receipts_for_erased_scope(
         &self,
         handle: &str,
+        scope: &str,
         digests: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        if digests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut found: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let digests: HashSet<&str> = digests.iter().map(String::as_str).collect();
         let mut statement = self.connection.prepare(
-            "SELECT r.receipt_id, r.raw FROM erasure_receipts r
-             JOIN receipt_snapshots c ON c.receipt_id = r.receipt_id
-             WHERE r.holder_handle = ?1 AND c.digest = ?2
-             ORDER BY r.issued_at DESC",
+            "SELECT r.receipt_id, r.raw, r.issued_at, r.terms_id, r.scope, c.digest
+               FROM erasure_receipts r
+               LEFT JOIN receipt_snapshots c ON c.receipt_id = r.receipt_id
+              WHERE r.holder_handle = ?1",
         )?;
-        for digest in digests {
-            let rows = statement.query_map(rusqlite::params![handle, digest], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (id, raw) = row?;
-                if seen.insert(id.clone()) {
-                    found.push((id, raw));
-                }
+        let rows = statement.query_map([handle], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+
+        let mut candidates: HashMap<String, (Vec<u8>, OffsetDateTime, String)> = HashMap::new();
+        for row in rows {
+            let (id, raw, issued_at, terms_id, receipt_scope, covered_digest) = row?;
+            let covers_requested = covered_digest
+                .as_deref()
+                .is_some_and(|digest| digests.contains(digest));
+            if receipt_scope == scope || covers_requested {
+                let issued_at = OffsetDateTime::parse(&issued_at, &Rfc3339)
+                    .map_err(|error| Error::Internal(format!("stored receipt timestamp: {error}")))?;
+                candidates.entry(id).or_insert((raw, issued_at, terms_id));
             }
         }
-        Ok(found)
+        let Some(newest) = candidates.values().map(|(_, issued_at, _)| *issued_at).max() else {
+            return Ok(Vec::new());
+        };
+        let mut newest_set: Vec<(String, Vec<u8>, String)> = candidates
+            .into_iter()
+            .filter(|(_, (_, issued_at, _))| *issued_at == newest)
+            .map(|(id, (raw, _, terms_id))| (id, raw, terms_id))
+            .collect();
+        newest_set.sort_by(|left, right| left.2.cmp(&right.2).then(left.0.cmp(&right.0)));
+        Ok(newest_set
+            .into_iter()
+            .map(|(id, raw, _)| (id, raw))
+            .collect())
     }
 
     /// References this holder has erased, within a scope.
@@ -640,35 +697,6 @@ impl Store {
                 .collect::<std::result::Result<Vec<String>, _>>()?
         };
         Ok(rows)
-    }
-
-    /// The **most recent** set of receipts issued for exactly this
-    /// scope, with their ids.
-    ///
-    /// What makes a retried erase idempotent: the snapshots are gone,
-    /// so there is nothing to erase, but the holder asking again is
-    /// owed the receipt rather than a 404 — which would be the same
-    /// "silence indistinguishable from never having stored it" that
-    /// `list` avoids by reporting `erased`.
-    ///
-    /// The most recent *set*, not every receipt ever issued for the
-    /// string: `scope: "all"` can be erased repeatedly, and returning
-    /// the union would grow without bound and mix commitments about
-    /// different bytes made on different days. Earlier sets stay
-    /// fetchable by id.
-    pub fn receipts_for_scope(&self, handle: &str, scope: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut statement = self.connection.prepare(
-            "SELECT receipt_id, raw FROM erasure_receipts
-             WHERE holder_handle = ?1 AND scope = ?2 AND issued_at = (
-                 SELECT MAX(issued_at) FROM erasure_receipts
-                 WHERE holder_handle = ?1 AND scope = ?2
-             )
-             ORDER BY terms_id",
-        )?;
-        let rows = statement.query_map(rusqlite::params![handle, scope], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The terms ids cited by this holder's receipts.
@@ -737,23 +765,44 @@ impl Store {
         )?)
     }
 
-    /// Drop receipts past the declared window.
-    pub fn sweep_receipts(&self, older_than: &str) -> Result<usize> {
+    /// Drop outcome records and receipts past their declared windows.
+    ///
+    /// Upload outcomes use the short `operationOutcomes` window.
+    /// Erase outcomes name receipt ids, so the profile binds them to
+    /// `erasureReceipts` instead: they must neither predecease nor
+    /// outlive the receipts they name.
+    ///
+    /// Coverage, receipts, and erase outcomes cross that boundary in
+    /// one transaction. A crash or concurrent reconciliation must not
+    /// observe a receipt fetchable by id after its coverage disappeared,
+    /// or a receipt without the erase outcome retained alongside it.
+    pub fn sweep_outcomes_and_receipts(
+        &mut self,
+        uploads_before: &str,
+        receipts_before: &str,
+    ) -> Result<(usize, usize)> {
+        let transaction = self.connection.transaction()?;
+        let outcomes = transaction.execute(
+            "DELETE FROM operation_outcomes
+             WHERE (status <> 'erased' AND recorded_at < ?1)
+                OR (status =  'erased' AND recorded_at < ?2)",
+            rusqlite::params![uploads_before, receipts_before],
+        )?;
         // Coverage first, while the receipts it points at still exist
-        // to be selected. Left behind, these rows would outlive the
-        // `erasureReceipts` window they belong to — a digest a holder
-        // erased, kept past the bound the terms declare, which is the
-        // §15 problem rather than only a leak.
-        self.connection.execute(
+        // to be selected. The transaction makes "first" invisible to
+        // readers until the receipt rows have gone too.
+        transaction.execute(
             "DELETE FROM receipt_snapshots WHERE receipt_id IN (
                  SELECT receipt_id FROM erasure_receipts WHERE issued_at < ?1
              )",
-            [older_than],
+            [receipts_before],
         )?;
-        Ok(self.connection.execute(
+        let receipts = transaction.execute(
             "DELETE FROM erasure_receipts WHERE issued_at < ?1",
-            [older_than],
-        )?)
+            [receipts_before],
+        )?;
+        transaction.commit()?;
+        Ok((outcomes, receipts))
     }
 
     /// Was anything in this scope erased, receipts aside?
@@ -778,30 +827,6 @@ impl Store {
             )?
         };
         Ok(count > 0)
-    }
-
-    /// Drop outcome records past their declared window.
-    ///
-    /// The upload window is short on purpose: keeping an operation id
-    /// is the per-holder timing trace §15 otherwise forbids, so it is a
-    /// declared few hours rather than an exception.
-    ///
-    /// **Erase outcomes are bounded by the receipt window instead.**
-    /// They name `receiptIds`, and §9.6 justifies the client-chosen
-    /// `operationId` by saying a lost erase response must not cost the
-    /// holder their receipt — which stops being true the moment the
-    /// outcome is swept, leaving them holding a receipt id they can no
-    /// longer learn. The asymmetry costs no privacy: the receipt rows
-    /// those ids point at are retained exactly that long anyway, and
-    /// each already carries its scope and coverage, so the outcome
-    /// beside them discloses nothing new.
-    pub fn sweep_outcomes(&self, uploads_before: &str, erasures_before: &str) -> Result<usize> {
-        Ok(self.connection.execute(
-            "DELETE FROM operation_outcomes
-             WHERE (status <> 'erased' AND recorded_at < ?1)
-                OR (status =  'erased' AND recorded_at < ?2)",
-            rusqlite::params![uploads_before, erasures_before],
-        )?)
     }
 
     /// A grant this holder already holds for this digest, if one is
@@ -930,6 +955,119 @@ mod tests {
         // Running it twice is what a restart does.
         store.migrate().unwrap();
         store.migrate().unwrap();
+    }
+
+    #[test]
+    fn migrate_preserves_outcomes_from_the_previous_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE operation_outcomes (
+                    operation_id  TEXT NOT NULL,
+                    holder_handle TEXT NOT NULL,
+                    digest        TEXT NOT NULL,
+                    status        TEXT NOT NULL,
+                    recorded_at   TEXT NOT NULL,
+                    PRIMARY KEY (holder_handle, operation_id)
+                );
+                INSERT INTO operation_outcomes
+                    (operation_id, holder_handle, digest, status, recorded_at)
+                VALUES
+                    ('op-old', 'holder', 'sha256:old', 'retained',
+                     '2026-08-20T10:00:00Z');
+                "#,
+            )
+            .unwrap();
+
+        let store = Store { connection };
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+
+        let outcome = store.outcome("holder", "op-old").unwrap().unwrap();
+        assert_eq!(outcome.0, "sha256:old");
+        assert_eq!(outcome.1, "retained");
+        assert_eq!(outcome.2, None);
+
+        store
+            .record_outcome(
+                "op-erase",
+                "holder",
+                "all",
+                "erased",
+                Some(r#"["receipt"]"#.into()),
+                "2026-08-20T11:00:00Z",
+            )
+            .unwrap();
+        let erased = store.outcome("holder", "op-erase").unwrap().unwrap();
+        assert_eq!(erased.0, "all");
+        assert_eq!(erased.2.as_deref(), Some(r#"["receipt"]"#));
+
+        let columns: Vec<String> = store
+            .connection
+            .prepare("PRAGMA table_info(operation_outcomes)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "subject"));
+        assert!(columns.iter().any(|column| column == "receipt_ids"));
+        assert!(!columns.iter().any(|column| column == "digest"));
+    }
+
+    #[test]
+    fn outcome_and_receipt_sweep_rolls_back_as_one_unit() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .record_outcome(
+                "op-erase",
+                "holder",
+                "sha256:old",
+                "erased",
+                Some(r#"["receipt"]"#.into()),
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .record_receipt(
+                "receipt",
+                "holder",
+                "sha256:old",
+                "terms",
+                br#"{"receiptId":"receipt"}"#,
+                &["sha256:old".into()],
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_receipt_delete
+                 BEFORE DELETE ON erasure_receipts
+                 BEGIN SELECT RAISE(ABORT, 'refuse delete'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .sweep_outcomes_and_receipts(
+                    "2027-01-01T00:00:00Z",
+                    "2027-01-01T00:00:00Z"
+                )
+                .is_err()
+        );
+        for table in [
+            "operation_outcomes",
+            "erasure_receipts",
+            "receipt_snapshots",
+        ] {
+            let count: i64 = store
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "{table} escaped the rollback");
+        }
     }
 
     /// The absence is the design. A table here would make this a

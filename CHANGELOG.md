@@ -64,6 +64,13 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Fixed
 
+- Existing stores migrate `operation_outcomes.digest` to `subject` and add
+  `receiptIds` without losing previously recorded outcomes.
+- Erasure replay chooses the newest receipt set across exact scopes and stored
+  digest coverage, so re-uploading a digest cannot revive a receipt from its
+  earlier storage lifecycle.
+- Signed metadata-retention durations come from the same configuration as the
+  sweeper, and outcome, receipt, and coverage expiry commits atomically.
 - **Re-uploading an erased digest reported `retained` and stored nothing.** The
   erased row kept the `(holder, digest)` primary key, so `INSERT OR IGNORE`
   silently dropped the re-upload while commit answered success, the download
