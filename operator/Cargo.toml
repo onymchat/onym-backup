@@ -1,0 +1,30 @@
+[package]
+name = "onym-backup-operator"
+version = "0.1.0"
+edition = "2021"
+description = "Retention operator for the Onym device-backup seat, object-HTTP profile"
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["limit", "trace"] }
+base64 = "0.22"
+hex = "0.4"
+# Ed25519 for holder proof-of-possession, for verifying a broker's
+# SeatEntitlement, and for signing this operator's own manifest, terms
+# and erasure receipts.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# `bundled` compiles SQLite in, so the runtime image needs no libsqlite3.
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# rustls-tls keeps us off OpenSSL, matching the moderation service's
+# runtime image. Used only to poll the broker's revocation epoch.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
