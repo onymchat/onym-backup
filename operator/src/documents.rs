@@ -282,6 +282,12 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             "operationOutcomes": "PT6H",
             "erasureReceipts": "P1Y",
             "entitlementRecords": "to expiry plus one revocation-epoch interval",
+            // Bounded at the grant's own expiry, and the bound is the
+            // point: an operator that kept expired grants in order to
+            // answer `upload_expired` rather than `upload_not_found`
+            // would be keeping a list of digests a holder started
+            // uploading and abandoned.
+            "uploadGrants": "to the grant's expiresAt",
         },
     })
 }

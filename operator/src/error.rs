@@ -75,6 +75,7 @@ pub enum Error {
         maximum_retained_snapshots: i64,
         retained_bytes: i64,
         limit_bytes: i64,
+        open_grants: i64,
     },
 
     /// Commit arrived before every chunk did. The grant survives and
@@ -82,7 +83,13 @@ pub enum Error {
     /// cost one chunk, not the whole snapshot.
     #[error("upload incomplete")]
     UploadIncomplete {
-        missing_chunks: Vec<i64>,
+        /// Inclusive `[first, last]` index ranges, not indices. A 5 GiB
+        /// snapshot at 8 MiB chunks is 640 indices, and a client that
+        /// has sent nothing would receive all of them — which is the
+        /// pressure that makes an operator truncate, and a truncated
+        /// gap list cannot be acted on in one round trip. Ranges are
+        /// compact for the common case and complete in every case.
+        missing_chunks: Vec<(i64, i64)>,
         chunk_count: i64,
     },
 
@@ -194,22 +201,27 @@ impl Error {
                 maximum_retained_snapshots,
                 retained_bytes,
                 limit_bytes,
+                open_grants,
             } => json!({
                 "retainedSnapshots": retained_snapshots,
                 "maximumRetainedSnapshots": maximum_retained_snapshots,
                 "retainedBytes": retained_bytes,
                 "limitBytes": limit_bytes,
+                // Issued grants count against the limit (§9.2 step 6),
+                // so without this a client sees usage below the maximum
+                // and a 409 beside it, with nothing naming what
+                // consumed the headroom. The refusal has to be legible
+                // from the refusal.
+                "openGrants": open_grants,
             }),
             Error::UploadIncomplete {
                 missing_chunks,
                 chunk_count,
             } => json!({
-                // Capped: a client that has sent nothing does not need
-                // every index enumerated back at it, and the count is
-                // what tells them the difference between "one chunk
-                // short" and "start again".
-                "missingChunks": missing_chunks.iter().take(64).collect::<Vec<_>>(),
-                "missingChunkCount": missing_chunks.len(),
+                "missingChunks": missing_chunks
+                    .iter()
+                    .map(|(first, last)| json!([first, last]))
+                    .collect::<Vec<_>>(),
                 "chunkCount": chunk_count,
             }),
             _ => json!({}),

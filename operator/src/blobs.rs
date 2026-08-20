@@ -68,20 +68,28 @@ impl Blobs {
         std::fs::write(&path, bytes).map_err(|e| Error::Internal(format!("write chunk: {e}")))
     }
 
-    /// What has arrived: total bytes, and the indices still missing.
+    /// What has arrived: total bytes, and the gaps as inclusive
+    /// `[first, last]` index ranges.
     ///
     /// Both, in one walk. Commit needs to distinguish "not finished
     /// yet" from "finished and wrong" — the first keeps the grant and
     /// names the gap, the second discards — and a bare byte count
     /// cannot tell them apart.
-    pub fn arrival(&self, upload_id: &str, chunk_count: i64) -> Result<(i64, Vec<i64>)> {
+    pub fn arrival(&self, upload_id: &str, chunk_count: i64) -> Result<(i64, Vec<(i64, i64)>)> {
         let mut total = 0;
-        let mut missing = Vec::new();
+        let mut missing: Vec<(i64, i64)> = Vec::new();
         for index in 0..chunk_count {
             let path = self.incoming_dir(upload_id).join(format!("{index}.part"));
             match std::fs::metadata(&path) {
                 Ok(metadata) => total += metadata.len() as i64,
-                Err(_) => missing.push(index),
+                Err(_) => match missing.last_mut() {
+                    // Extend the open run rather than starting a new
+                    // one: an interrupted upload is normally one
+                    // contiguous gap, and that is the case worth being
+                    // compact about.
+                    Some(last) if last.1 == index - 1 => last.1 = index,
+                    _ => missing.push((index, index)),
+                },
             }
         }
         Ok((total, missing))
@@ -279,7 +287,8 @@ mod tests {
         blobs.write_chunk("u1", 0, b"abc").unwrap();
         // The gap is reported as an index, so a client can send one
         // chunk rather than the whole snapshot again.
-        assert_eq!(blobs.arrival("u1", 3).unwrap(), (3, vec![1, 2]));
+        // One contiguous gap is one range, not two indices.
+        assert_eq!(blobs.arrival("u1", 3).unwrap(), (3, vec![(1, 2)]));
     }
 
     #[test]

@@ -175,14 +175,15 @@ pub async fn preflight(
     // re-checks and is the authoritative gate; counting grants here is
     // what keeps the refusal cheap, which is why preflight exists.
     let (retained, retained_bytes) = store.usage(&holder.handle)?;
-    let committed = retained + store.open_grants(&holder.handle, &now_stamp)?;
-    if committed >= state.config.maximum_retained_snapshots {
+    let open_grants = store.open_grants(&holder.handle, &now_stamp)?;
+    if retained + open_grants >= state.config.maximum_retained_snapshots {
         return Err(Error::QuotaExceeded {
             retained_snapshots: retained,
             maximum_retained_snapshots: state.config.maximum_retained_snapshots,
             retained_bytes,
             limit_bytes: state.config.maximum_sealed_snapshot_bytes
                 * state.config.maximum_retained_snapshots,
+            open_grants,
         });
     }
 
@@ -372,6 +373,9 @@ pub async fn commit(
                     retained_bytes,
                     limit_bytes: state.config.maximum_sealed_snapshot_bytes
                         * state.config.maximum_retained_snapshots,
+                    // This grant is the one being committed, so it is
+                    // no longer headroom anybody is waiting on.
+                    open_grants: 0,
                 });
             }
         }
@@ -982,6 +986,61 @@ pub mod tests {
         assert_eq!(bytes, snapshot, "the streamed bytes came back changed");
     }
 
+    /// A refusal a client cannot act on is a refusal that will be
+    /// retried forever. The count that decides is `retained +
+    /// openGrants`, so both terms are in the body — otherwise a holder
+    /// sees usage below the maximum and a 409 beside it.
+    #[tokio::test]
+    async fn a_quota_refusal_names_the_grants_holding_the_headroom() {
+        let harness = Harness::new(vec![]);
+        let terms = harness.terms_id();
+        for seed in [0u8, 50] {
+            let snapshot: Vec<u8> = (seed..seed + 20).collect();
+            harness
+                .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+                .await;
+        }
+        let third: Vec<u8> = (100..120u8).collect();
+        let (status, body) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&third, &terms))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["retainedSnapshots"], json!(0), "nothing is retained yet");
+        assert_eq!(error["openGrants"], json!(2), "the grants are invisible");
+        assert_eq!(error["maximumRetainedSnapshots"], json!(2));
+    }
+
+    /// One interrupted run is one range, however long — which is the
+    /// case ranges exist for.
+    #[tokio::test]
+    async fn a_long_contiguous_gap_is_one_range() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..80u8).collect();
+        let terms = harness.terms_id();
+        let (_, grant) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let grant: serde_json::Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        assert_eq!(grant["chunkCount"], json!(10));
+
+        // Only the first chunk lands; the connection dies after it.
+        harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/0"), snapshot[..8].to_vec())
+            .await;
+        let (status, body) = harness
+            .send("POST", &format!("/v1/uploads/{upload_id}/commit"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error["missingChunks"],
+            json!([[1, 9]]),
+            "nine missing chunks were not collapsed into one range"
+        );
+    }
+
     /// The digest reaches the filesystem as a path segment. The
     /// database lookup would refuse a malformed one today because
     /// nothing matches it — that is a reason to validate anyway, not a
@@ -1115,7 +1174,10 @@ pub mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "upload_incomplete");
-        assert_eq!(error["missingChunks"], json!([1]), "the gap was not named");
+        // Inclusive ranges, not indices: one contiguous gap is one
+        // range however long it is.
+        assert_eq!(error["missingChunks"], json!([[1, 1]]), "the gap was not named");
+        assert_eq!(error["chunkCount"], json!(3));
 
         // The grant survives, so recovery is one chunk.
         let (status, _) = harness
