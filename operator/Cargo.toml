@@ -28,3 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # rustls-tls keeps us off OpenSSL, matching the moderation service's
 # runtime image. Used only to poll the broker's revocation epoch.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+# `oneshot` for router tests without binding a port.
+tower = { version = "0.4", features = ["util"] }

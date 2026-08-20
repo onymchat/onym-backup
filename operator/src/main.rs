@@ -17,9 +17,12 @@
 //!   logged; the holder, the digest, the upload id and the operation id
 //!   are not, and none of them is aggregated per holder over time.
 
+mod api;
 mod config;
+mod documents;
 mod error;
 mod payload;
+mod store;
 
 use std::process::exit;
 
@@ -52,5 +55,57 @@ async fn main() {
         "onym-backup-operator starting"
     );
 
-    // Routes land next; this boots, validates, and says what it is.
+    let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
+    let documents = match documents::Documents::build(&config, &signing) {
+        Ok(documents) => documents,
+        Err(error) => {
+            eprintln!("could not build published documents: {error}");
+            exit(1);
+        }
+    };
+    tracing::info!(
+        operator = %documents.operator_key,
+        terms = %documents.terms.0,
+        "published documents signed"
+    );
+
+    let store = match store::Store::open(&config.store_path) {
+        Ok(store) => store,
+        Err(error) => {
+            // Failing here rather than serving: an operator that cannot
+            // write its bookkeeping would accept snapshots it has no
+            // record of, which is worse than being down.
+            eprintln!("could not open {}: {error}", config.store_path);
+            exit(1);
+        }
+    };
+
+    let bind_addr = config.bind_addr.clone();
+    let state = std::sync::Arc::new(api::AppState {
+        config,
+        documents,
+        store: tokio::sync::Mutex::new(store),
+    });
+
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("could not bind {bind_addr}: {error}");
+            exit(1);
+        }
+    };
+    tracing::info!(%bind_addr, "listening");
+
+    // `DefaultBodyLimit`, not `RequestBodyLimitLayer`. Both cap a body;
+    // only the former can be raised on one route. The §9 chunk upload
+    // needs its own, larger bound from the grant, and a tower layer
+    // wrapping the whole router has no opt-out — the ceiling would have
+    // been discovered when uploads landed and looked like a client bug.
+    let app = api::router(state).layer(axum::extract::DefaultBodyLimit::max(
+        api::MAX_JSON_BODY_BYTES,
+    ));
+    if let Err(error) = axum::serve(listener, app).await {
+        tracing::error!(%error, "server stopped");
+        exit(1);
+    }
 }
