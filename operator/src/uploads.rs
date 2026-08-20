@@ -59,18 +59,26 @@ pub struct UploadGrant {
 /// multi-hundred-megabyte upload** — that is the entire reason this
 /// route exists, and an operator that skips it does not conform.
 ///
-/// The order of the checks matters and two of them are counterintuitive:
+/// The order of the checks matters and three of them are
+/// counterintuitive:
 ///
-/// 1. `terms_changed` — nothing may be pinned to terms nobody agreed to.
-/// 2. `payment_required` — before any bytes move.
-/// 3. `already_retained` — **before** the size and quota checks.
+/// 1. **grant resume — ahead of the terms check.** A holder halfway
+///    through an upload when the operator publishes new terms would
+///    otherwise be refused at (2) and never reach resume, stranding
+///    their grant against the quota until it expires. The grant is
+///    itself the record of consent to the terms it was minted under,
+///    and the request must carry *those* terms to resume it.
+/// 2. `terms_changed` — nothing new may be pinned to terms nobody
+///    agreed to.
+/// 3. `payment_required` — before any bytes move.
+/// 4. `already_retained` — **before** the size and quota checks.
 ///    Re-preflighting a digest we already hold adds no bytes, so a
 ///    holder at their limit reconciling a lost response must get
 ///    `already_retained` rather than `quota_exceeded`. Idempotent
 ///    reconciliation has to keep working *at* the limit, which is
 ///    exactly where it gets used.
-/// 4. `snapshot_too_large`, then 5. `quota_exceeded` — the two checks
-///    that bound accepting *new* bytes, and therefore both after (3).
+/// 5. `snapshot_too_large`, then 6. `quota_exceeded` — the two checks
+///    that bound accepting *new* bytes, and therefore both after (4).
 pub async fn preflight(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -119,14 +127,53 @@ pub async fn preflight(
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
 
-    // (1) Terms.
+    // (1) A grant this holder already has for this digest, resumed.
+    //
+    // Ahead of the terms check, not after it. A holder halfway through
+    // an upload when the operator publishes new terms would otherwise
+    // be refused at (2) and never reach resume: their grant strands
+    // against the quota until it expires, which is the harm resume
+    // exists to prevent, arriving by the one route that cannot be
+    // retried out of. The grant is itself the record of consent to the
+    // terms it was minted under, and terms bind forward — a snapshot
+    // accepted under T1 keeps T1 — so finishing that upload under T1 is
+    // what the pinning already promises.
+    //
+    // The `accepted_terms_id` condition is what keeps this narrow: the
+    // request must carry the *grant's* terms, so this resumes an agreed
+    // upload and is never a route around consent.
+    if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
+        if open.accepted_terms_id == request.accepted_terms_id {
+            // Two byte counts for one digest is a contradiction, and
+            // choosing between them is not the operator's job.
+            // `supersedes` is different: the grant keeps what it was
+            // minted with, since refusing would strand the holder until
+            // expiry holding quota headroom they cannot release.
+            if open.sealed_byte_size != reference.sealed_byte_size {
+                return Err(Error::BadRequest(
+                    "sealedByteSize disagrees with the open grant for this digest".into(),
+                ));
+            }
+            let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
+            return Ok(axum::Json(UploadGrant {
+                upload_id: open.upload_id,
+                chunk_bytes: open.chunk_bytes,
+                chunk_count: open.chunk_count,
+                expires_at: open.expires_at,
+                missing_chunks: missing,
+            })
+            .into_response());
+        }
+    }
+
+    // (2) Terms.
     if request.accepted_terms_id != state.documents.terms.0 {
         return Err(Error::TermsChanged {
             current_terms_id: state.documents.terms.0.clone(),
         });
     }
 
-    // (2) Payment. Free operators never reach this.
+    // (3) Payment. Free operators never reach this.
     if state.config.requires_entitlement() {
         return Err(Error::PaymentRequired {
             component_id: state.config.component_id.clone(),
@@ -135,7 +182,7 @@ pub async fn preflight(
         });
     }
 
-    // (3) Already held — before the bounds, deliberately.
+    // (4) Already held — before the bounds, deliberately.
     if store.snapshot_exists(&holder.handle, &reference.digest)? {
         return Ok(axum::Json(json!({
             "outcome": {
@@ -153,40 +200,14 @@ pub async fn preflight(
         .into_response());
     }
 
-    // (3b) A grant this holder already has for this digest. Returned
-    // rather than replaced: a lost grant response otherwise leaves an
-    // orphan counting against the quota, and the holder can do nothing
-    // about it but wait for it to expire.
-    if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
-        // Two byte counts for one digest is a contradiction, and
-        // choosing between them is not the operator's job. `supersedes`
-        // is different: the grant keeps what it was minted with, since
-        // refusing would strand the holder until expiry holding quota
-        // headroom they cannot release.
-        if open.sealed_byte_size != reference.sealed_byte_size {
-            return Err(Error::BadRequest(
-                "sealedByteSize disagrees with the open grant for this digest".into(),
-            ));
-        }
-        let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
-        return Ok(axum::Json(UploadGrant {
-            upload_id: open.upload_id,
-            chunk_bytes: open.chunk_bytes,
-            chunk_count: open.chunk_count,
-            expires_at: open.expires_at,
-            missing_chunks: missing,
-        })
-        .into_response());
-    }
-
-    // (4) Size.
+    // (5) Size.
     if reference.sealed_byte_size > state.config.maximum_sealed_snapshot_bytes {
         return Err(Error::SnapshotTooLarge {
             maximum_sealed_snapshot_bytes: state.config.maximum_sealed_snapshot_bytes,
         });
     }
 
-    // (5) Quota. Never resolved by dropping an older snapshot — that is
+    // (6) Quota. Never resolved by dropping an older snapshot — that is
     // the holder's call, not ours.
     //
     // Open grants count. Retained rows alone are a number that has not
@@ -414,6 +435,8 @@ pub async fn commit(
             &upload.holder_handle,
             &upload.digest,
             "retained",
+            // An upload produces no receipts.
+            None,
             &retained_at,
         )?;
     }
@@ -969,10 +992,10 @@ pub mod tests {
         {
             let store = harness.state.store.lock().await;
             store
-                .record_outcome(shared_operation, &harness.handle(), "sha256:aa", "retained", "2026-01-01T00:00:00Z")
+                .record_outcome(shared_operation, &harness.handle(), "sha256:aa", "retained", None, "2026-01-01T00:00:00Z")
                 .unwrap();
             store
-                .record_outcome(shared_operation, &stranger.handle(), "sha256:bb", "retained", "2026-01-02T00:00:00Z")
+                .record_outcome(shared_operation, &stranger.handle(), "sha256:bb", "retained", None, "2026-01-02T00:00:00Z")
                 .unwrap();
 
             // Both rows survive, each under its own holder.
@@ -1209,6 +1232,57 @@ pub mod tests {
             json!([[1, 2]]),
             "the resumed grant does not say what arrived"
         );
+    }
+
+    /// A grant is resumable across a terms change, because the grant
+    /// is itself the record of consent to the terms it was minted
+    /// under. Refusing at the terms step would strand it against the
+    /// quota until expiry — the harm resume exists to prevent, by the
+    /// one route that cannot be retried out of.
+    #[tokio::test]
+    async fn a_grant_survives_the_terms_changing_under_it() {
+        let mut harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let minted_under = harness.terms_id();
+        let (_, grant) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &minted_under))
+            .await;
+        let grant: serde_json::Value = serde_json::from_slice(&grant).unwrap();
+        let upload_id = grant["uploadId"].as_str().unwrap().to_string();
+        harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/0"), snapshot[..8].to_vec())
+            .await;
+
+        // The operator publishes new terms mid-upload.
+        let mut config = Config::for_tests("onym:component:test", vec![]);
+        config.chunk_bytes = 8;
+        // A different declared limit, so the terms document — which
+        // carries `snapshotsRetained` — really does hash differently.
+        config.maximum_retained_snapshots = 7;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
+        let fresh = Documents::build(&config, &signing).unwrap();
+        assert_ne!(fresh.terms.0, minted_under, "the fixture did not change the terms");
+        {
+            let state = Arc::get_mut(&mut harness.state).unwrap();
+            state.documents = fresh;
+        }
+
+        // The grant resumes, carrying the terms it was minted under.
+        let (status, resumed) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &minted_under))
+            .await;
+        assert_eq!(status, StatusCode::OK, "the grant was stranded by a terms change");
+        let resumed: serde_json::Value = serde_json::from_slice(&resumed).unwrap();
+        assert_eq!(resumed["uploadId"], json!(upload_id));
+        assert_eq!(resumed["missingChunks"], json!([[1, 2]]));
+
+        // A *new* snapshot under stale terms is still refused: this is
+        // a resumption, not a route around consent.
+        let other: Vec<u8> = (50..70u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&other, &minted_under))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     /// Two byte counts for one digest is a contradiction, and choosing

@@ -38,7 +38,7 @@ pub async fn query(
     // unscoped lookup would let one holder read another's outcome by
     // guessing — and the ids are only as unguessable as the client
     // that minted them.
-    let (subject, status, recorded_at) = store
+    let (subject, status, receipt_ids, recorded_at) = store
         .outcome(&holder.handle, &operation_id)
         .map_err(Error::from)?
         .ok_or(Error::NotFound(Resource::Operation))?;
@@ -48,16 +48,23 @@ pub async fn query(
     // field called `digest` reporting "all" is a scope wearing a
     // digest's name.
     let subject_field = if status == "erased" { "scope" } else { "digest" };
-    Ok(axum::Json(json!({
-        "outcome": {
-            "componentId": state.config.component_id,
-            "operationId": operation_id,
-            "status": status,
-            subject_field: subject,
-            "recordedAt": recorded_at,
-        }
-    }))
-    .into_response())
+    let mut outcome = json!({
+        "componentId": state.config.component_id,
+        "operationId": operation_id,
+        "status": status,
+        subject_field: subject,
+        "recordedAt": recorded_at,
+    });
+    // §9.6 justifies the client-chosen operationId by saying a lost
+    // erase response must not cost the holder their receipt — which is
+    // only true if reconciling by that id yields something §9.7 can be
+    // asked for. Without this the holder recovers the fact of the
+    // erasure and still cannot name the receipt.
+    if let Some(ids) = receipt_ids {
+        let ids: Vec<String> = serde_json::from_str(&ids).unwrap_or_default();
+        outcome["receiptIds"] = json!(ids);
+    }
+    Ok(axum::Json(json!({ "outcome": outcome })).into_response())
 }
 
 #[cfg(test)]

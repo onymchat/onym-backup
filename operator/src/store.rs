@@ -103,6 +103,13 @@ impl Store {
                 -- erasure, which is a scope wearing a digest's name.
                 subject       TEXT NOT NULL,
                 status        TEXT NOT NULL,
+                -- JSON array of receiptIds for an erasure, NULL
+                -- otherwise. §9.6 justifies the client-chosen
+                -- operationId by saying a lost erase response must not
+                -- cost the holder their receipt — which is only true if
+                -- reconciling by that id yields something §9.7 can be
+                -- asked for.
+                receipt_ids   TEXT,
                 recorded_at   TEXT NOT NULL,
                 PRIMARY KEY (holder_handle, operation_id)
             );
@@ -391,13 +398,14 @@ impl Store {
         handle: &str,
         subject: &str,
         status: &str,
+        receipt_ids: Option<String>,
         recorded_at: &str,
     ) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO operation_outcomes
-                (operation_id, holder_handle, subject, status, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![operation_id, handle, subject, status, recorded_at],
+                (operation_id, holder_handle, subject, status, receipt_ids, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![operation_id, handle, subject, status, receipt_ids, recorded_at],
         )?;
         Ok(())
     }
@@ -485,20 +493,33 @@ impl Store {
         Ok(())
     }
 
-    /// Receipts already issued for exactly this scope.
+    /// The **most recent** set of receipts issued for exactly this
+    /// scope, with their ids.
     ///
     /// What makes a retried erase idempotent: the snapshots are gone,
     /// so there is nothing to erase, but the holder asking again is
     /// owed the receipt rather than a 404 — which would be the same
     /// "silence indistinguishable from never having stored it" that
     /// `list` avoids by reporting `erased`.
-    pub fn receipts_for_scope(&self, handle: &str, scope: &str) -> Result<Vec<Vec<u8>>> {
+    ///
+    /// The most recent *set*, not every receipt ever issued for the
+    /// string: `scope: "all"` can be erased repeatedly, and returning
+    /// the union would grow without bound and mix commitments about
+    /// different bytes made on different days. Earlier sets stay
+    /// fetchable by id.
+    pub fn receipts_for_scope(&self, handle: &str, scope: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut statement = self.connection.prepare(
-            "SELECT raw FROM erasure_receipts
-             WHERE holder_handle = ?1 AND scope = ?2 ORDER BY issued_at",
+            "SELECT receipt_id, raw FROM erasure_receipts
+             WHERE holder_handle = ?1 AND scope = ?2 AND issued_at = (
+                 SELECT MAX(issued_at) FROM erasure_receipts
+                 WHERE holder_handle = ?1 AND scope = ?2
+             )
+             ORDER BY terms_id",
         )?;
-        let rows = statement.query_map(rusqlite::params![handle, scope], |row| row.get(0))?;
-        Ok(rows.collect::<std::result::Result<Vec<Vec<u8>>, _>>()?)
+        let rows = statement.query_map(rusqlite::params![handle, scope], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The terms ids cited by this holder's receipts.
@@ -553,13 +574,18 @@ impl Store {
     }
 
     /// The outcome recorded for one holder's operation, if any.
-    pub fn outcome(&self, handle: &str, operation_id: &str) -> Result<Option<(String, String, String)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn outcome(
+        &self,
+        handle: &str,
+        operation_id: &str,
+    ) -> Result<Option<(String, String, Option<String>, String)>> {
         let mut statement = self.connection.prepare(
-            "SELECT subject, status, recorded_at FROM operation_outcomes
+            "SELECT subject, status, receipt_ids, recorded_at FROM operation_outcomes
              WHERE holder_handle = ?1 AND operation_id = ?2",
         )?;
         let mut rows = statement.query_map(rusqlite::params![handle, operation_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         Ok(rows.next().transpose()?)
     }

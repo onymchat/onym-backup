@@ -61,6 +61,7 @@ pub async fn erase(
         .map_err(|e| Error::Internal(e.to_string()))?;
 
     let mut receipts = Vec::new();
+    let mut issued: Vec<String> = Vec::new();
     {
         let store = state.store.lock().await;
         let holder = authenticate(
@@ -89,6 +90,7 @@ pub async fn erase(
             // `list` avoids by reporting `erased`.
             let existing = store.receipts_for_scope(&holder.handle, &request.scope)?;
             if !existing.is_empty() {
+                let ids: Vec<&str> = existing.iter().map(|(id, _)| id.as_str()).collect();
                 // The retry's own operation id is recorded too, so a
                 // client that retries with a fresh id and loses *that*
                 // response can still reconcile it. Otherwise the retry
@@ -98,6 +100,7 @@ pub async fn erase(
                     &holder.handle,
                     &request.scope,
                     "erased",
+                    Some(serde_json::to_string(&ids).unwrap_or_default()),
                     &stamp,
                 )?;
                 return Ok(axum::Json(decode_receipts(existing)?).into_response());
@@ -156,7 +159,19 @@ pub async fn erase(
                 .ok_or(Error::NotFound(Resource::Terms))?;
             let terms: Value = serde_json::from_slice(&raw)
                 .map_err(|e| Error::Internal(format!("stored terms: {e}")))?;
-            let receipt = compose(&state, &terms, &terms_id, &request.scope, &stamp)?;
+            // The references this receipt covers. Every receipt for a
+            // `scope: "all"` echoes the same scope string and differs
+            // only in termsId, so without this a holder holding three
+            // of them cannot tell which bytes each commitment is
+            // about — and coveredScope/excludedScope would describe a
+            // set nobody can enumerate.
+            let covered: Vec<String> = targets
+                .iter()
+                .filter(|row| row.accepted_terms_id == terms_id)
+                .map(|row| row.digest.clone())
+                .collect();
+            let receipt =
+                compose(&state, &terms, &terms_id, &request.scope, &covered, &stamp)?;
             let receipt_id = receipt["receiptId"]
                 .as_str()
                 .ok_or_else(|| Error::Internal("receipt has no id".into()))?
@@ -170,6 +185,7 @@ pub async fn erase(
                 &signed,
                 &stamp,
             )?;
+            issued.push(receipt_id);
             receipts.push(document);
         }
 
@@ -178,6 +194,7 @@ pub async fn erase(
             &holder.handle,
             &request.scope,
             "erased",
+            Some(serde_json::to_string(&issued).unwrap_or_default()),
             &stamp,
         )?;
     }
@@ -185,9 +202,9 @@ pub async fn erase(
     Ok(axum::Json(receipts).into_response())
 }
 
-fn decode_receipts(raw: Vec<Vec<u8>>) -> Result<Vec<Value>> {
+fn decode_receipts(raw: Vec<(String, Vec<u8>)>) -> Result<Vec<Value>> {
     raw.iter()
-        .map(|bytes| {
+        .map(|(_, bytes)| {
             serde_json::from_slice(bytes)
                 .map_err(|e| Error::Internal(format!("stored receipt: {e}")))
         })
@@ -195,11 +212,13 @@ fn decode_receipts(raw: Vec<Vec<u8>>) -> Result<Vec<Value>> {
 }
 
 /// One receipt, against one pinned terms document.
+#[allow(clippy::too_many_arguments)]
 fn compose(
     state: &Arc<AppState>,
     terms: &Value,
     terms_id: &str,
     scope: &str,
+    snapshots: &[String],
     acknowledged_at: &str,
 ) -> Result<Value> {
     let erasure = &terms["erasure"];
@@ -236,6 +255,7 @@ fn compose(
         "receiptId": hex::encode(uuid::Uuid::new_v4().as_bytes()),
         "operator": state.documents.operator_key,
         "scope": scope,
+        "snapshots": snapshots,
         "acknowledgedAt": acknowledged_at,
         "completionCommittedBy": committed_by,
         "coveredScope": covered,
@@ -865,5 +885,87 @@ mod tests {
 
         let (status, _) = harness.send("GET", "/v1/exports/receipts/r1", vec![]).await;
         assert_eq!(status, StatusCode::OK, "a receipt was withheld from an unpaid holder");
+    }
+
+    /// Every receipt for a `scope: "all"` echoes the same scope string
+    /// and differs only in `termsId`, so without `snapshots` a holder
+    /// cannot tell which bytes each signed commitment is about.
+    #[tokio::test]
+    async fn a_receipt_names_the_snapshots_it_covers() {
+        let harness = Harness::new(vec![]);
+        let first: Vec<u8> = (0..20u8).collect();
+        let second: Vec<u8> = (50..70u8).collect();
+        harness.store_snapshot(&first).await;
+        harness.store_snapshot(&second).await;
+
+        let (_, receipts) = erase(&harness, "all").await;
+        let receipt = &receipts.as_array().unwrap()[0];
+        let covered: Vec<&str> = receipt["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for snapshot in [&first, &second] {
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(snapshot)));
+            assert!(covered.contains(&digest.as_str()), "{digest} is not named");
+        }
+    }
+
+    /// §9.6 justifies the client-chosen operationId by saying a lost
+    /// erase response must not cost the holder their receipt — which is
+    /// only true if reconciling by that id yields something §9.7 can be
+    /// asked for. This is the whole path a holder walks after losing
+    /// the response.
+    #[tokio::test]
+    async fn a_lost_erase_response_leads_back_to_the_receipt() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase_as(&harness, &digest, "op-lost").await;
+
+        // The response never arrived. All the holder has is the id.
+        let (status, body) = harness.send("GET", "/v1/operations/op-lost", vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        let ids = outcome["outcome"]["receiptIds"].as_array().unwrap();
+        assert_eq!(ids.len(), 1, "the outcome does not name the receipts");
+
+        let id = ids[0].as_str().unwrap();
+        let (status, body) = harness
+            .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the named receipt is unfetchable");
+        let receipt: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt["scope"], json!(digest));
+    }
+
+    /// Replay returns the most recent set, not every receipt ever
+    /// issued for the string — which would grow without bound and mix
+    /// commitments about different bytes made on different days.
+    #[tokio::test]
+    async fn replay_returns_only_the_latest_set() {
+        let harness = Harness::new(vec![]);
+        harness.store_snapshot(&(0..20u8).collect::<Vec<u8>>()).await;
+        let (_, first) = erase(&harness, "all").await;
+        let first_id = first[0]["receiptId"].as_str().unwrap().to_string();
+
+        harness.store_snapshot(&(50..70u8).collect::<Vec<u8>>()).await;
+        let (_, second) = erase(&harness, "all").await;
+        let second_id = second[0]["receiptId"].as_str().unwrap().to_string();
+
+        let (status, replay) = erase(&harness, "all").await;
+        assert_eq!(status, StatusCode::OK);
+        let replay = replay.as_array().unwrap();
+        assert_eq!(replay.len(), 1, "the replay accumulated receipts");
+        assert_eq!(replay[0]["receiptId"], json!(second_id));
+        assert_ne!(replay[0]["receiptId"], json!(first_id));
+
+        // The earlier one is not reissued, but nothing is lost.
+        let (status, _) = harness
+            .send("GET", &format!("/v1/exports/receipts/{first_id}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }
