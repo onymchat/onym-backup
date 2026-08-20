@@ -143,6 +143,22 @@ impl Store {
                 issued_at     TEXT NOT NULL
             );
 
+            -- Which references each receipt covers.
+            --
+            -- Scope strings are not comparable: a receipt minted for
+            -- `all` covers digests that a later single-digest erase
+            -- names directly, and matching on the string alone would
+            -- tell that holder their evidence had aged out while it sat
+            -- fetchable by id. Coverage is the thing that actually
+            -- relates a receipt to a snapshot, so it is stored as such.
+            CREATE TABLE IF NOT EXISTS receipt_snapshots (
+                receipt_id TEXT NOT NULL,
+                digest     TEXT NOT NULL,
+                PRIMARY KEY (receipt_id, digest)
+            );
+            CREATE INDEX IF NOT EXISTS receipt_snapshots_by_digest
+                ON receipt_snapshots (digest);
+
             CREATE TABLE IF NOT EXISTS holder_entitlements (
                 entitlement_id TEXT PRIMARY KEY,
                 holder_handle  TEXT NOT NULL,
@@ -455,11 +471,14 @@ impl Store {
 
     /// Snapshots in an erasure's scope: one digest, or all of them.
     pub fn snapshots_in_scope(&self, handle: &str, scope: &str) -> Result<Vec<RetainedRow>> {
-        let all = self.snapshots(handle)?;
         if scope == "all" {
-            return Ok(all);
+            return self.snapshots(handle);
         }
-        Ok(all.into_iter().filter(|row| row.digest == scope).collect())
+        Ok(self
+            .snapshots(handle)?
+            .into_iter()
+            .filter(|row| row.digest == scope)
+            .collect())
     }
 
     /// Mark a snapshot erased. The row survives its bytes: `list` must
@@ -482,6 +501,7 @@ impl Store {
         scope: &str,
         terms_id: &str,
         raw: &[u8],
+        covers: &[String],
         issued_at: &str,
     ) -> Result<()> {
         self.connection.execute(
@@ -490,7 +510,70 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![receipt_id, handle, scope, terms_id, raw, issued_at],
         )?;
+        for digest in covers {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO receipt_snapshots (receipt_id, digest)
+                 VALUES (?1, ?2)",
+                rusqlite::params![receipt_id, digest],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Live receipts covering any of these references, whatever scope
+    /// string they were issued under.
+    ///
+    /// The honest answer to "was this erased, and is the evidence still
+    /// here?" — which scope-string equality cannot give, because a
+    /// receipt minted for `all` covers digests a later single-digest
+    /// retry names directly.
+    pub fn receipts_covering(
+        &self,
+        handle: &str,
+        digests: &[String],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        if digests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut statement = self.connection.prepare(
+            "SELECT r.receipt_id, r.raw FROM erasure_receipts r
+             JOIN receipt_snapshots c ON c.receipt_id = r.receipt_id
+             WHERE r.holder_handle = ?1 AND c.digest = ?2
+             ORDER BY r.issued_at DESC",
+        )?;
+        for digest in digests {
+            let rows = statement.query_map(rusqlite::params![handle, digest], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (id, raw) = row?;
+                if seen.insert(id.clone()) {
+                    found.push((id, raw));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// References this holder has erased, within a scope.
+    pub fn erased_digests(&self, handle: &str, scope: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(if scope == "all" {
+            "SELECT digest FROM snapshots
+             WHERE holder_handle = ?1 AND erased_at IS NOT NULL"
+        } else {
+            "SELECT digest FROM snapshots
+             WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NOT NULL"
+        })?;
+        let rows = if scope == "all" {
+            statement.query_map(rusqlite::params![handle], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?
+        } else {
+            statement.query_map(rusqlite::params![handle, scope], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?
+        };
+        Ok(rows)
     }
 
     /// The **most recent** set of receipts issued for exactly this
@@ -536,22 +619,6 @@ impl Store {
             .prepare("SELECT DISTINCT terms_id FROM erasure_receipts WHERE holder_handle = ?1")?;
         let rows = statement.query_map([handle], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
-    }
-
-    /// A receipt already issued for this scope under these terms.
-    ///
-    /// Erasure re-checks this under the lock before minting. The lock
-    /// is deliberately dropped for the blob work, so two erases of one
-    /// scope can both find live targets; without this each mints a
-    /// fresh receipt and a later retry returns both.
-    pub fn receipt_for(&self, handle: &str, scope: &str, terms_id: &str) -> Result<Option<Vec<u8>>> {
-        let mut statement = self.connection.prepare(
-            "SELECT raw FROM erasure_receipts
-             WHERE holder_handle = ?1 AND scope = ?2 AND terms_id = ?3",
-        )?;
-        let mut rows =
-            statement.query_map(rusqlite::params![handle, scope, terms_id], |row| row.get(0))?;
-        Ok(rows.next().transpose()?)
     }
 
     /// One receipt by id, scoped to its holder.

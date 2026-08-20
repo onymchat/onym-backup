@@ -206,11 +206,12 @@ impl Blobs {
 
     /// Remove a snapshot's bytes. Absent is success.
     ///
-    /// Two erases of the same scope can arrive together — the store
-    /// lock is not held across blob work, deliberately — and an
-    /// `exists()` guard would still lose the race between the check and
-    /// the removal. "Already gone" is the outcome the caller wanted, so
-    /// it is not an error; anything else is.
+    /// Erasure serialises under the store lock, but the sweep does
+    /// not take it for the disk walk — so a snapshot can vanish between
+    /// this call and its own `remove_dir_all`, and an `exists()` guard
+    /// would lose the race between the check and the removal anyway.
+    /// "Already gone" is the outcome the caller wanted, so it is not an
+    /// error; anything else is.
     pub fn erase(&self, handle: &str, digest_hex: &str) -> Result<()> {
         match std::fs::remove_dir_all(self.snapshot_dir(handle, digest_hex)) {
             Ok(()) => Ok(()),

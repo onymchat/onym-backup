@@ -105,11 +105,30 @@ pub async fn erase(
                 )?;
                 return Ok(axum::Json(decode_receipts(existing)?).into_response());
             }
-            // Erased, but the receipts have aged out. The snapshot
-            // rows outlive them, so the operator knows this happened
+            // Nothing under this exact scope string — but a receipt
+            // minted for `all` covers digests a later single-digest
+            // retry names directly, and vice versa. Matching on the
+            // string alone would tell that holder their evidence aged
+            // out while it sat fetchable by id.
+            let erased = store.erased_digests(&holder.handle, &request.scope)?;
+            let covering = store.receipts_covering(&holder.handle, &erased)?;
+            if !covering.is_empty() {
+                let ids: Vec<&str> = covering.iter().map(|(id, _)| id.as_str()).collect();
+                store.record_outcome(
+                    &request.operation_id,
+                    &holder.handle,
+                    &request.scope,
+                    "erased",
+                    Some(serde_json::to_string(&ids).unwrap_or_default()),
+                    &stamp,
+                )?;
+                return Ok(axum::Json(decode_receipts(covering)?).into_response());
+            }
+            // Erased, and no receipt survives. The snapshot rows
+            // outlive the receipts, so the operator knows this happened
             // and says so rather than answering "no such snapshot"
             // about an erasure the holder requested themselves.
-            if store.scope_was_erased(&holder.handle, &request.scope)? {
+            if !erased.is_empty() {
                 return Err(Error::ReceiptExpired);
             }
             // Never held, so there is nothing to commit to. A receipt
@@ -118,21 +137,34 @@ pub async fn erase(
             return Err(Error::NotFound(Resource::Snapshot));
         }
         // The lock is held from target selection through to the
-        // receipts, unlike upload's commit. Two erases of one scope
-        // would otherwise both find live targets and each mint a
-        // receipt, making the receipt count a record of concurrency
-        // rather than of erasures. The reason it is affordable here and
-        // not there: erasing is `unlink` per chunk, bounded by file
-        // count, where commit hashes every byte.
+        // receipts. Two erases of one scope would otherwise both find
+        // live targets and each mint a receipt, making the receipt
+        // count a record of concurrency rather than of erasures.
+        //
+        // Holding the lock is not the same as doing the work here,
+        // though: `remove_dir_all` over every chunk of every snapshot
+        // is blocking I/O, and on a runtime thread it stalls the
+        // executor as well as the lock. It goes to the blocking pool
+        // like every other blob operation — the guard is held across
+        // the await, which is what serialises erasures, and nothing is
+        // unlinked on the runtime thread.
         //
         // Bytes first, then the rows. A crash between them leaves a
         // record whose bytes are gone, which the sweep resolves and
         // which `list` reports as erased — the safe direction. The
         // reverse would leave bytes the holder believes are gone.
-        for row in &targets {
-            let digest_hex = crate::uploads::digest_hex(&row.digest)?;
-            state.blobs.erase(&holder.handle, &digest_hex)?;
-        }
+        let doomed: Vec<String> = targets
+            .iter()
+            .map(|row| crate::uploads::digest_hex(&row.digest))
+            .collect::<Result<Vec<_>>>()?;
+        let handle = holder.handle.clone();
+        crate::uploads::blocking(&state, move |state| {
+            for digest_hex in &doomed {
+                state.blobs.erase(&handle, digest_hex)?;
+            }
+            Ok(())
+        })
+        .await?;
 
         for row in &targets {
             store.mark_erased(&holder.handle, &row.digest, &stamp)?;
@@ -183,6 +215,7 @@ pub async fn erase(
                 &request.scope,
                 &terms_id,
                 &signed,
+                &covered,
                 &stamp,
             )?;
             issued.push(receipt_id);
@@ -880,7 +913,7 @@ mod tests {
             .store
             .lock()
             .await
-            .record_receipt("r1", &harness.handle(), "all", "sha256:aa", &receipt, "2026-01-01T00:00:00Z")
+            .record_receipt("r1", &harness.handle(), "all", "sha256:aa", &receipt, &[], "2026-01-01T00:00:00Z")
             .unwrap();
 
         let (status, _) = harness.send("GET", "/v1/exports/receipts/r1", vec![]).await;
@@ -967,5 +1000,42 @@ mod tests {
             .send("GET", &format!("/v1/exports/receipts/{first_id}"), vec![])
             .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Scope strings are not comparable, and a holder must not be told
+    /// their evidence aged out while it sits fetchable by id.
+    ///
+    /// Both directions: a receipt minted for `all` covers digests a
+    /// later single-digest retry names directly, and a receipt minted
+    /// for one digest is part of what a later `all` retry asks about.
+    #[tokio::test]
+    async fn a_retry_under_a_different_scope_still_finds_the_receipt() {
+        // all → digest
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        let (_, minted) = erase(&harness, "all").await;
+        let minted_id = minted[0]["receiptId"].as_str().unwrap().to_string();
+
+        let (status, body) = erase(&harness, &digest).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a live receipt was reported as expired: {body}"
+        );
+        assert_eq!(body[0]["receiptId"], json!(minted_id));
+
+        // digest → all
+        let other = Harness::new(vec![]);
+        let second: Vec<u8> = (50..70u8).collect();
+        other.store_snapshot(&second).await;
+        let second_digest = format!("sha256:{}", hex::encode(Sha256::digest(&second)));
+        let (_, first) = erase(&other, &second_digest).await;
+        let first_id = first[0]["receiptId"].as_str().unwrap().to_string();
+
+        let (status, body) = erase(&other, "all").await;
+        assert_eq!(status, StatusCode::OK, "a live receipt was reported as expired");
+        assert_eq!(body[0]["receiptId"], json!(first_id));
     }
 }
