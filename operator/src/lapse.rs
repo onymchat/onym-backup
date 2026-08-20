@@ -205,8 +205,9 @@ pub fn evaluate(
     }
 
     let revoked = state.revocation.revoked();
-    let Some(horizon) = store.entitlement_horizon(&holder.handle, &revoked)? else {
-        // No unrevoked record. Either they never paid, or their records
+    let Some((horizon, horizon_revoked)) = store.entitlement_horizon(&holder.handle, &revoked)?
+    else {
+        // No record at all. Either they never paid, or their records
         // aged out of `entitlementRecords` — which is well past every
         // grace window either way.
         return Ok(if store.has_entitlement_record(&holder.handle)? {
@@ -218,11 +219,17 @@ pub fn evaluate(
 
     let expires_at = OffsetDateTime::parse(&horizon, &Rfc3339)
         .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
-    if now < expires_at {
+    if !horizon_revoked && now < expires_at {
         // Registered, unexpired, just not attached to this request.
         return Ok(Access::Entitled);
     }
 
+    // Revoked and not yet at its own `expiresAt`: still blocked from new
+    // paid work — the shortcut above is what grants `Entitled`, and it
+    // was skipped — but the terms a snapshot was accepted under still
+    // govern it, so grace is derived from the same `expiresAt` the
+    // credential itself declared rather than from the moment revocation
+    // was noticed.
     grace_from(store, holder, expires_at, now)
 }
 
@@ -343,7 +350,7 @@ pub fn post_grace_due(
     revoked: &HashSet<String>,
     now: OffsetDateTime,
 ) -> Result<Vec<(String, String)>> {
-    let Some(horizon) = store.entitlement_horizon(handle, revoked)? else {
+    let Some((horizon, _)) = store.entitlement_horizon(handle, revoked)? else {
         // Nothing to lapse from. A holder with no entitlement record on
         // a charging operator is one whose records aged out — and
         // acting on that would make `entitlementRecords` expiry into a
@@ -859,6 +866,113 @@ mod tests {
         // And only now, in the pass that acted on it, does the record
         // itself go — 50 days is past 44 plus a poll interval.
         assert_eq!(swept.aged_entitlements, 1, "the record was kept past every window it could open");
+    }
+
+    /// Revocation must not erase the timestamp the rest of lapse is
+    /// derived from.
+    ///
+    /// `entitlement_horizon` used to drop a revoked id from
+    /// consideration outright. For a holder with exactly one
+    /// entitlement, revoking it made the horizon `None` — `evaluate`
+    /// then read that as "no record" and returned `Lapsed` immediately,
+    /// skipping the grace the terms had already promised, and
+    /// `post_grace_due` had nothing left to derive a due date from and
+    /// returned empty forever, so the snapshot was retained past every
+    /// window it could open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revocation_blocks_new_work_without_erasing_the_lapse_horizon() {
+        let (harness, snapshot, _) = holder_with_a_snapshot().await;
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+
+        let now = OffsetDateTime::now_utc();
+        harness.state.revocation.install(
+            crate::revocation::Epoch {
+                epoch: 1,
+                published_at: now,
+                revoked: HashSet::from(["ent-1".to_string()]),
+                raw: Vec::new(),
+            },
+            now,
+        );
+
+        // Revoked, well before the credential's own `expiresAt` (30
+        // days out). New paid work is refused immediately...
+        let terms = harness.terms_id();
+        let fresh: Vec<u8> = (100..120u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&fresh, &terms))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "a revoked-but-unexpired entitlement still granted new work"
+        );
+
+        // ...but the snapshot's own terms — pinned at accept time — are
+        // still honoured, because the horizon is still the credential's
+        // real `expiresAt`, not nothing.
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "revocation closed a grace window the terms still owed"
+        );
+
+        // Move `expiresAt` itself past notice-and-grace (14 + 30 = 44
+        // days) so the credential's own window is over. The record must
+        // still be there to derive the post-grace expiry from, and the
+        // snapshot must actually expire.
+        lapsed_days_ago(&harness, 50).await;
+
+        let poll = crate::config::Config::for_tests("onym:component:test", vec![])
+            .revocation_poll_secs as i64;
+        let sweep_now = |harness: &Harness| {
+            let at = OffsetDateTime::now_utc();
+            let revoked = harness.state.revocation.revoked();
+            tokio::task::block_in_place(|| {
+                let floor = record_floor(&harness.state.store.blocking_lock(), poll, at)
+                    .unwrap()
+                    .format(&Rfc3339)
+                    .unwrap();
+                crate::sweep::reconcile(
+                    &harness.state.store,
+                    &harness.state.blob_mutations,
+                    &harness.state.blobs,
+                    &revoked,
+                    at,
+                    crate::sweep::Cutoffs {
+                        now: &at.format(&Rfc3339).unwrap(),
+                        nonce: "2000-01-01T00:00:00Z",
+                        outcome: "2000-01-01T00:00:00Z",
+                        receipt: "2000-01-01T00:00:00Z",
+                        erased_reference: "2000-01-01T00:00:00Z",
+                        entitlement: &floor,
+                    },
+                )
+            })
+        };
+
+        let swept = sweep_now(&harness);
+        assert_eq!(
+            swept.post_grace_snapshots, 1,
+            "post-grace expiry never fired for a revoked holder's snapshot"
+        );
+
+        let (_, body) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows[0]["status"], json!("retention_expired"));
+
+        assert!(
+            !harness
+                .state
+                .blobs
+                .retained_on_disk()
+                .into_iter()
+                .any(|(_, digest)| digest == hex_digest),
+            "the bytes outlived the retention that justified holding them"
+        );
     }
 
     /// The two rules that are easy to get backwards, asserted directly

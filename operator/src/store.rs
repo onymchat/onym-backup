@@ -545,24 +545,30 @@ impl Store {
     }
 
     /// The latest `expiresAt` among this holder's registered
-    /// entitlements, revoked ids excluded.
+    /// entitlements, and whether that record is itself revoked.
     ///
     /// The *latest*, not the first found: a holder who renewed early
     /// holds two credentials at once, and lapsing them on the older
     /// one's expiry would cut off someone who has already paid for the
-    /// next period.
+    /// next period. Revoked records are preferred out of that choice —
+    /// a refunded entitlement that still sat in the table must not hold
+    /// a live one's protection off — but never dropped outright: if
+    /// every record is revoked, the latest revoked `expiresAt` is
+    /// returned rather than nothing, with the flag set so the caller
+    /// stops trusting it for new access without losing the timestamp
+    /// lapse, grace and the sweep all derive from.
     ///
-    /// Revocation is applied here as well as at presentation because
-    /// this is what lapse reads. A refunded entitlement that still sat
-    /// in the table would hold lapse off indefinitely — the holder
-    /// would stop being able to upload (presentation refuses the
-    /// credential) while never entering grace, which is the worst of
-    /// both.
+    /// Returning `None` here when a revoked record was the holder's
+    /// only one used to erase that timestamp entirely: `evaluate` fell
+    /// straight to `Lapsed`, skipping the grace a still-unexpired
+    /// credential's terms had already promised, and `post_grace_due`
+    /// had nothing to derive from and returned empty forever, so the
+    /// snapshot's bytes were never expired at all.
     pub fn entitlement_horizon(
         &self,
         handle: &str,
         revoked: &HashSet<String>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, bool)>> {
         let mut statement = self.connection.prepare(
             "SELECT entitlement_id, expires_at FROM holder_entitlements
              WHERE holder_handle = ?1",
@@ -570,20 +576,24 @@ impl Store {
         let rows = statement.query_map([handle], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut horizon: Option<(OffsetDateTime, String)> = None;
+        let mut live: Option<(OffsetDateTime, String)> = None;
+        let mut any: Option<(OffsetDateTime, String)> = None;
         for row in rows {
             let (id, expires_at) = row?;
-            if revoked.contains(&id) {
-                continue;
-            }
             let Ok(at) = OffsetDateTime::parse(&expires_at, &Rfc3339) else {
                 continue;
             };
-            if horizon.as_ref().is_none_or(|(held, _)| at > *held) {
-                horizon = Some((at, expires_at));
+            if any.as_ref().is_none_or(|(held, _)| at > *held) {
+                any = Some((at, expires_at.clone()));
+            }
+            if !revoked.contains(&id) && live.as_ref().is_none_or(|(held, _)| at > *held) {
+                live = Some((at, expires_at));
             }
         }
-        Ok(horizon.map(|(_, text)| text))
+        Ok(match live {
+            Some((_, text)) => Some((text, false)),
+            None => any.map(|(_, text)| (text, true)),
+        })
     }
 
     /// Whether this holder has ever registered an entitlement.
