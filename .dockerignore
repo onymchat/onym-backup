@@ -1,0 +1,12 @@
+# A built Rust tree is far larger than its source, and the whole build
+# context is uploaded to the builder. Without this, every deploy ships
+# target/ across the wire.
+operator/target/
+target/
+.git/
+.github/
+# Publishing artifacts and the discovery signing seed. The seed must
+# never reach an image; the rest is output, not input.
+deploy/discovery/out/
+deploy/discovery/reviewed/
+*.seed
