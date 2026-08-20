@@ -47,6 +47,10 @@ pub struct Config {
     /// timing trace §15 otherwise forbids; the resolution is a bound,
     /// not an exception, and it is measured in hours.
     pub outcome_retention_secs: i64,
+    /// How long issued erasure receipts are re-servable. Declared in
+    /// `metadataRetention.erasureReceipts`, and swept — a window
+    /// nothing enforces is a window in name only.
+    pub receipt_retention_secs: i64,
 }
 
 impl Config {
@@ -138,6 +142,10 @@ impl Config {
             chunk_bytes: chunk_bytes()?,
             upload_expiry_secs: parse_positive_i64("BACKUP_UPLOAD_EXPIRY_SECS", 24 * 3600)?,
             max_skew_secs: parse_positive_i64("BACKUP_MAX_SKEW_SECS", 300)?,
+            receipt_retention_secs: parse_positive_i64(
+                "BACKUP_RECEIPT_RETENTION_SECS",
+                365 * 24 * 3600,
+            )?,
             outcome_retention_secs: parse_positive_i64(
                 "BACKUP_OUTCOME_RETENTION_SECS",
                 6 * 3600,
@@ -169,6 +177,7 @@ impl Config {
             chunk_bytes: 8 * 1024 * 1024,
             upload_expiry_secs: 24 * 3600,
             max_skew_secs: 300,
+            receipt_retention_secs: 365 * 24 * 3600,
             outcome_retention_secs: 6 * 3600,
         }
     }

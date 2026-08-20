@@ -564,6 +564,38 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    /// Drop receipts past the declared window.
+    pub fn sweep_receipts(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM erasure_receipts WHERE issued_at < ?1",
+            [older_than],
+        )?)
+    }
+
+    /// Was anything in this scope erased, receipts aside?
+    ///
+    /// The snapshot rows outlive the receipts, so this is what
+    /// separates "erased, and the receipt aged out" from "never held".
+    /// The first is `receipt_expired`; the second is a 404.
+    pub fn scope_was_erased(&self, handle: &str, scope: &str) -> Result<bool> {
+        let count: i64 = if scope == "all" {
+            self.connection.query_row(
+                "SELECT COUNT(*) FROM snapshots
+                 WHERE holder_handle = ?1 AND erased_at IS NOT NULL",
+                [handle],
+                |row| row.get(0),
+            )?
+        } else {
+            self.connection.query_row(
+                "SELECT COUNT(*) FROM snapshots
+                 WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NOT NULL",
+                rusqlite::params![handle, scope],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count > 0)
+    }
+
     /// Drop outcome records past the declared window.
     ///
     /// The window is short on purpose: keeping an operation id is the

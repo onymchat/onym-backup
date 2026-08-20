@@ -132,6 +132,7 @@ async fn main() {
         let state = state.clone();
         let skew = state.config.max_skew_secs;
         let outcome_window = state.config.outcome_retention_secs;
+        let receipt_window = state.config.receipt_retention_secs;
         tokio::spawn(async move {
             loop {
                 let state = state.clone();
@@ -148,14 +149,18 @@ async fn main() {
                     // the table closes.
                     let floor = at - time::Duration::seconds(skew * 2);
                     let outcomes = at - time::Duration::seconds(outcome_window);
-                    match (stamp(at), stamp(floor), stamp(outcomes)) {
-                        (Ok(now), Ok(floor), Ok(outcomes)) => Some(sweep::reconcile(
-                            &state.store,
-                            &state.blobs,
-                            &now,
-                            &floor,
-                            &outcomes,
-                        )),
+                    let receipts = at - time::Duration::seconds(receipt_window);
+                    match (stamp(at), stamp(floor), stamp(outcomes), stamp(receipts)) {
+                        (Ok(now), Ok(floor), Ok(outcomes), Ok(receipts)) => {
+                            Some(sweep::reconcile(
+                                &state.store,
+                                &state.blobs,
+                                &now,
+                                &floor,
+                                &outcomes,
+                                &receipts,
+                            ))
+                        }
                         _ => None,
                     }
                 })
@@ -168,6 +173,7 @@ async fn main() {
                             + swept.orphan_snapshots
                             + swept.spent_nonces
                             + swept.aged_outcomes
+                            + swept.aged_receipts
                             > 0
                         {
                             tracing::info!(
@@ -176,6 +182,7 @@ async fn main() {
                                 orphan_snapshots = swept.orphan_snapshots,
                                 spent_nonces = swept.spent_nonces,
                                 aged_outcomes = swept.aged_outcomes,
+                                aged_receipts = swept.aged_receipts,
                                 "swept"
                             );
                         }

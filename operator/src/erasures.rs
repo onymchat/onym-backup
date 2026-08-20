@@ -60,7 +60,8 @@ pub async fn erase(
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
 
-    let (holder, request, targets) = {
+    let mut receipts = Vec::new();
+    {
         let store = state.store.lock().await;
         let holder = authenticate(
             &headers,
@@ -101,29 +102,35 @@ pub async fn erase(
                 )?;
                 return Ok(axum::Json(decode_receipts(existing)?).into_response());
             }
+            // Erased, but the receipts have aged out. The snapshot
+            // rows outlive them, so the operator knows this happened
+            // and says so rather than answering "no such snapshot"
+            // about an erasure the holder requested themselves.
+            if store.scope_was_erased(&holder.handle, &request.scope)? {
+                return Err(Error::ReceiptExpired);
+            }
             // Never held, so there is nothing to commit to. A receipt
             // for an empty scope would be a signed statement about
             // nothing.
             return Err(Error::NotFound(Resource::Snapshot));
         }
-        (holder, request, targets)
-    };
-    let scope = request.scope;
+        // The lock is held from target selection through to the
+        // receipts, unlike upload's commit. Two erases of one scope
+        // would otherwise both find live targets and each mint a
+        // receipt, making the receipt count a record of concurrency
+        // rather than of erasures. The reason it is affordable here and
+        // not there: erasing is `unlink` per chunk, bounded by file
+        // count, where commit hashes every byte.
+        //
+        // Bytes first, then the rows. A crash between them leaves a
+        // record whose bytes are gone, which the sweep resolves and
+        // which `list` reports as erased — the safe direction. The
+        // reverse would leave bytes the holder believes are gone.
+        for row in &targets {
+            let digest_hex = crate::uploads::digest_hex(&row.digest)?;
+            state.blobs.erase(&holder.handle, &digest_hex)?;
+        }
 
-    // Bytes first, then the rows. A crash between them leaves a record
-    // whose bytes are gone, which the sweep resolves and which `list`
-    // reports as erased — the safe direction. The reverse would leave
-    // bytes the holder believes are gone.
-    for row in &targets {
-        let digest_hex = crate::uploads::digest_hex(&row.digest)?;
-        let handle = holder.handle.clone();
-        crate::uploads::blocking(&state, move |state| state.blobs.erase(&handle, &digest_hex))
-            .await?;
-    }
-
-    let mut receipts = Vec::new();
-    {
-        let store = state.store.lock().await;
         for row in &targets {
             store.mark_erased(&holder.handle, &row.digest, &stamp)?;
         }
@@ -136,26 +143,20 @@ pub async fn erase(
         pinned.dedup();
 
         for terms_id in pinned {
-            // Re-checked under the lock. The lock is dropped for the
-            // blob work, so two erases of one scope can both have found
-            // live targets; without this each mints a fresh receipt and
-            // a later retry hands back both, which would make the
-            // receipt count a record of concurrency rather than of
-            // erasures.
-            if let Some(raw) = store.receipt_for(&holder.handle, &scope, &terms_id)? {
-                receipts.push(
-                    serde_json::from_slice(&raw)
-                        .map_err(|e| Error::Internal(format!("stored receipt: {e}")))?,
-                );
-                continue;
-            }
-
+            // A fresh receipt every time something was actually erased.
+            // `scope: "all"` is evaluated at request time, so erasing
+            // "all" again after new snapshots were retained is a new
+            // erasure of new bytes — handing back the earlier receipt
+            // would misdate the commitment, since `acknowledgedAt` and
+            // `completionCommittedBy` are about the erasure that
+            // produced it. Replay belongs to the empty-scope path
+            // above, and only there.
             let (raw, _) = store
                 .terms_document(&terms_id)?
                 .ok_or(Error::NotFound(Resource::Terms))?;
             let terms: Value = serde_json::from_slice(&raw)
                 .map_err(|e| Error::Internal(format!("stored terms: {e}")))?;
-            let receipt = compose(&state, &terms, &terms_id, &scope, &stamp)?;
+            let receipt = compose(&state, &terms, &terms_id, &request.scope, &stamp)?;
             let receipt_id = receipt["receiptId"]
                 .as_str()
                 .ok_or_else(|| Error::Internal("receipt has no id".into()))?
@@ -164,7 +165,7 @@ pub async fn erase(
             store.record_receipt(
                 &receipt_id,
                 &holder.handle,
-                &scope,
+                &request.scope,
                 &terms_id,
                 &signed,
                 &stamp,
@@ -175,7 +176,7 @@ pub async fn erase(
         store.record_outcome(
             &request.operation_id,
             &holder.handle,
-            &scope,
+            &request.scope,
             "erased",
             &stamp,
         )?;
@@ -683,6 +684,7 @@ mod tests {
                 "2099-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
             )
         });
         assert_eq!(swept.orphan_snapshots, 0, "the sweep deleted a live snapshot");
@@ -763,5 +765,105 @@ mod tests {
             manifest["terms"][0]["termsId"],
             json!(harness.terms_id())
         );
+    }
+
+    /// `scope: "all"` means "all, now" — it is evaluated at request
+    /// time, so erasing it again after new snapshots were retained is a
+    /// new erasure of new bytes. Replaying the first receipt would
+    /// misdate the commitment: `acknowledgedAt` and
+    /// `completionCommittedBy` are about the erasure that produced it.
+    #[tokio::test]
+    async fn erasing_all_again_covers_what_arrived_since() {
+        let harness = Harness::new(vec![]);
+        let first: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&first).await;
+        let (_, original) = erase(&harness, "all").await;
+        let original_id = original[0]["receiptId"].as_str().unwrap().to_string();
+
+        // A new snapshot arrives, and "all" is asked for again.
+        let second: Vec<u8> = (50..70u8).collect();
+        harness.store_snapshot(&second).await;
+        let (status, again) = erase(&harness, "all").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            again[0]["receiptId"].as_str().unwrap(),
+            original_id,
+            "the second erasure replayed the first receipt"
+        );
+
+        // Both remain fetchable by id — the earlier one is not reissued
+        // but it is not destroyed either.
+        for id in [original_id.as_str(), again[0]["receiptId"].as_str().unwrap()] {
+            let (status, _) = harness
+                .send("GET", &format!("/v1/exports/receipts/{id}"), vec![])
+                .await;
+            assert_eq!(status, StatusCode::OK, "receipt {id} is gone");
+        }
+
+        // And the new snapshot really was erased.
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        for row in listed.as_array().unwrap() {
+            assert_eq!(row["status"], "erased");
+        }
+    }
+
+    /// Once the receipts age out, the erasure is still a fact the
+    /// operator knows. `receipt_expired`, not a 404 that reads like the
+    /// snapshot never existed — and not `retention_expired`, which a
+    /// client maps to a sentence about a snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aged_out_receipt_is_not_a_missing_snapshot() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase(&harness, &digest).await;
+
+        tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                // Every receipt is now past its window.
+                "2099-01-01T00:00:00Z",
+            )
+        });
+
+        let (status, body) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"], "receipt_expired");
+
+        // A scope that was never held is still a 404: the difference is
+        // whether the operator knows an erasure happened.
+        let (status, _) = erase(&harness, &format!("sha256:{}", "cc".repeat(32))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// §9.7's routes must all be reachable without an entitlement, and
+    /// the receipt route is the one a holder reaches in exactly the
+    /// state where a check would be tempting: after erasing everything,
+    /// or after lapsing. Evidence conditioned on payment is not
+    /// evidence.
+    #[tokio::test]
+    async fn a_receipt_is_fetchable_without_an_entitlement() {
+        let harness = Harness::new(vec![format!("onym:key:{}", "aa".repeat(32))]);
+        assert!(harness.state.config.requires_entitlement());
+
+        // Seed a receipt directly: this operator charges, so the upload
+        // path is closed and the fixture is about the read path.
+        let receipt = serde_json::to_vec(&json!({"receiptVersion": 1, "receiptId": "r1"})).unwrap();
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .record_receipt("r1", &harness.handle(), "all", "sha256:aa", &receipt, "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        let (status, _) = harness.send("GET", "/v1/exports/receipts/r1", vec![]).await;
+        assert_eq!(status, StatusCode::OK, "a receipt was withheld from an unpaid holder");
     }
 }

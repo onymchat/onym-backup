@@ -120,6 +120,15 @@ pub enum Error {
     #[error("retention expired")]
     RetentionExpired,
 
+    /// The scope was erased and its receipts have aged out.
+    ///
+    /// Distinct from `retention_expired`, which §14 maps to an abstract
+    /// state about a *snapshot*. A client reusing that mapping would
+    /// render "retained once, no longer held" to a holder asking about
+    /// an erasure they requested themselves.
+    #[error("receipt expired")]
+    ReceiptExpired,
+
     /// `{0}` matters: without it `thiserror` generates a `Display` that
     /// discards the payload, and the log below — which formats with
     /// `%self` — records the literal "internal error" for every
@@ -151,6 +160,7 @@ impl Error {
             Error::NotFound(Resource::Terms) => "terms_not_found",
             Error::NotFound(Resource::Receipt) => "receipt_not_found",
             Error::RetentionExpired => "retention_expired",
+            Error::ReceiptExpired => "receipt_expired",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -168,7 +178,7 @@ impl Error {
             Error::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::SnapshotTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::RetentionExpired => StatusCode::GONE,
+            Error::RetentionExpired | Error::ReceiptExpired => StatusCode::GONE,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
