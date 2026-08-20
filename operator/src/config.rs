@@ -51,6 +51,12 @@ pub struct Config {
     /// `metadataRetention.erasureReceipts`, and swept — a window
     /// nothing enforces is a window in name only.
     pub receipt_retention_secs: i64,
+    /// How long an erased snapshot's reference is remembered after its
+    /// bytes are gone. `list` reports `erased` and `/v1/erasures`
+    /// answers `receipt_expired` only while it survives — past it, both
+    /// degrade to "unknown digest", which is the operator having
+    /// genuinely forgotten rather than pretending.
+    pub erased_reference_retention_secs: i64,
 }
 
 impl Config {
@@ -146,6 +152,10 @@ impl Config {
                 "BACKUP_RECEIPT_RETENTION_SECS",
                 365 * 24 * 3600,
             )?,
+            erased_reference_retention_secs: parse_positive_i64(
+                "BACKUP_ERASED_REFERENCE_RETENTION_SECS",
+                365 * 24 * 3600,
+            )?,
             outcome_retention_secs: parse_positive_i64(
                 "BACKUP_OUTCOME_RETENTION_SECS",
                 6 * 3600,
@@ -178,6 +188,7 @@ impl Config {
             upload_expiry_secs: 24 * 3600,
             max_skew_secs: 300,
             receipt_retention_secs: 365 * 24 * 3600,
+            erased_reference_retention_secs: 365 * 24 * 3600,
             outcome_retention_secs: 6 * 3600,
         }
     }

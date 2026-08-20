@@ -43,6 +43,11 @@ pub struct UploadGrant {
     pub chunk_bytes: i64,
     pub chunk_count: i64,
     pub expires_at: String,
+    /// The terms this grant was minted under, which the committed
+    /// snapshot will pin. Stated because a resumed grant may carry
+    /// terms older than the ones the request asked for, and a client
+    /// that wanted the newer ones can only tell by being told.
+    pub accepted_terms_id: String,
     /// What has not arrived, as inclusive `[first, last]` ranges.
     ///
     /// Present on a fresh grant too, as one range covering everything,
@@ -143,27 +148,42 @@ pub async fn preflight(
     // request must carry the *grant's* terms, so this resumes an agreed
     // upload and is never a route around consent.
     if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
-        if open.accepted_terms_id == request.accepted_terms_id {
-            // Two byte counts for one digest is a contradiction, and
-            // choosing between them is not the operator's job.
-            // `supersedes` is different: the grant keeps what it was
-            // minted with, since refusing would strand the holder until
-            // expiry holding quota headroom they cannot release.
-            if open.sealed_byte_size != reference.sealed_byte_size {
-                return Err(Error::BadRequest(
-                    "sealedByteSize disagrees with the open grant for this digest".into(),
-                ));
-            }
-            let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
-            return Ok(axum::Json(UploadGrant {
-                upload_id: open.upload_id,
-                chunk_bytes: open.chunk_bytes,
-                chunk_count: open.chunk_count,
-                expires_at: open.expires_at,
-                missing_chunks: missing,
-            })
-            .into_response());
+        // Any live grant, not only one whose terms match the request.
+        // A condition on matching terms is not a narrowing, it is a
+        // hole: a client re-preflighting with current terms for a
+        // digest whose grant was minted under older ones would fall
+        // past this branch, pass every remaining check, and be issued a
+        // *second* uploadId for the same reference — two grants against
+        // one digest, both counting against the quota, when only expiry
+        // is supposed to release the first.
+        //
+        // Nothing is bypassed by resuming unconditionally. The grant
+        // exists only because this operator issued it under terms the
+        // holder had accepted, and terms bind forward. The response
+        // says which terms they were, so a client that wanted the newer
+        // ones can abandon this upload and wait for it to expire rather
+        // than finish it.
+        //
+        // Two byte counts for one digest is a contradiction, and
+        // choosing between them is not the operator's job. `supersedes`
+        // and `acceptedTermsId` are different: the grant keeps what it
+        // was minted with, because the committed snapshot must not pin
+        // something no accepted request asked for.
+        if open.sealed_byte_size != reference.sealed_byte_size {
+            return Err(Error::BadRequest(
+                "sealedByteSize disagrees with the open grant for this digest".into(),
+            ));
         }
+        let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
+        return Ok(axum::Json(UploadGrant {
+            upload_id: open.upload_id,
+            chunk_bytes: open.chunk_bytes,
+            chunk_count: open.chunk_count,
+            expires_at: open.expires_at,
+            accepted_terms_id: open.accepted_terms_id,
+            missing_chunks: missing,
+        })
+        .into_response());
     }
 
     // (2) Terms.
@@ -256,6 +276,7 @@ pub async fn preflight(
         chunk_bytes,
         chunk_count,
         expires_at,
+        accepted_terms_id: request.accepted_terms_id.clone(),
         // Nothing has arrived, so one range covers it — the same shape
         // a resume returns, so a client branches on neither.
         missing_chunks: vec![(0, chunk_count - 1)],
@@ -1292,6 +1313,59 @@ pub mod tests {
             .send("POST", "/v1/preflight", harness.preflight_body(&other, &minted_under))
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// A live grant resumes whatever terms the request carries.
+    ///
+    /// Conditioning resume on matching terms is not a narrowing but a
+    /// hole: the request falls past resume, passes every remaining
+    /// check, and is issued a *second* uploadId for the same digest —
+    /// two grants against one reference, both against the quota, when
+    /// only expiry is supposed to release the first.
+    #[tokio::test]
+    async fn a_live_grant_is_never_duplicated_by_a_terms_change() {
+        let mut harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let minted_under = harness.terms_id();
+        let (_, first) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &minted_under))
+            .await;
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let upload_id = first["uploadId"].as_str().unwrap().to_string();
+
+        // The operator publishes new terms; the client consents and
+        // re-preflights the *same* snapshot under them.
+        let mut config = Config::for_tests("onym:component:test", vec![]);
+        config.chunk_bytes = 8;
+        config.maximum_retained_snapshots = 7;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
+        let fresh = Documents::build(&config, &signing).unwrap();
+        let current = fresh.terms.0.clone();
+        assert_ne!(current, minted_under);
+        {
+            let state = Arc::get_mut(&mut harness.state).unwrap();
+            state.documents = fresh;
+        }
+
+        let (status, resumed) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &current))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let resumed: serde_json::Value = serde_json::from_slice(&resumed).unwrap();
+        assert_eq!(
+            resumed["uploadId"], json!(upload_id),
+            "a second grant was minted for a digest that already had one"
+        );
+        // And it says which terms it will pin, so a client that wanted
+        // the newer ones can tell.
+        assert_eq!(resumed["acceptedTermsId"], json!(minted_under));
+
+        // Exactly one grant exists for this holder.
+        let store = harness.state.store.lock().await;
+        let (grants, _) = store
+            .open_grants(&harness.handle(), "2000-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(grants, 1, "the holder holds two grants for one digest");
     }
 
     /// Two byte counts for one digest is a contradiction, and choosing

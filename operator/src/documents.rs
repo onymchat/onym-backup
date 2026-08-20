@@ -292,6 +292,12 @@ fn default_terms(config: &Config, operator_key: &str) -> Value {
             // for an hour would be the comfortable answer rather than
             // the true one.
             "uploadGrants": "PT1H",
+            // What is remembered about a snapshot after its bytes are
+            // gone: the reference and when it went. Something must
+            // outlive the bytes or an erasure is indistinguishable from
+            // a snapshot never stored — and it is bounded for the same
+            // reason it exists.
+            "erasedReferences": "P1Y",
         },
     })
 }

@@ -133,6 +133,7 @@ async fn main() {
         let skew = state.config.max_skew_secs;
         let outcome_window = state.config.outcome_retention_secs;
         let receipt_window = state.config.receipt_retention_secs;
+        let erased_window = state.config.erased_reference_retention_secs;
         tokio::spawn(async move {
             loop {
                 let state = state.clone();
@@ -150,8 +151,15 @@ async fn main() {
                     let floor = at - time::Duration::seconds(skew * 2);
                     let outcomes = at - time::Duration::seconds(outcome_window);
                     let receipts = at - time::Duration::seconds(receipt_window);
-                    match (stamp(at), stamp(floor), stamp(outcomes), stamp(receipts)) {
-                        (Ok(now), Ok(floor), Ok(outcomes), Ok(receipts)) => {
+                    let erased = at - time::Duration::seconds(erased_window);
+                    match (
+                        stamp(at),
+                        stamp(floor),
+                        stamp(outcomes),
+                        stamp(receipts),
+                        stamp(erased),
+                    ) {
+                        (Ok(now), Ok(floor), Ok(outcomes), Ok(receipts), Ok(erased)) => {
                             Some(sweep::reconcile(
                                 &state.store,
                                 &state.blobs,
@@ -159,6 +167,7 @@ async fn main() {
                                 &floor,
                                 &outcomes,
                                 &receipts,
+                                &erased,
                             ))
                         }
                         _ => None,
@@ -174,6 +183,7 @@ async fn main() {
                             + swept.spent_nonces
                             + swept.aged_outcomes
                             + swept.aged_receipts
+                            + swept.forgotten_references
                             > 0
                         {
                             tracing::info!(
@@ -183,6 +193,7 @@ async fn main() {
                                 spent_nonces = swept.spent_nonces,
                                 aged_outcomes = swept.aged_outcomes,
                                 aged_receipts = swept.aged_receipts,
+                                forgotten_references = swept.forgotten_references,
                                 "swept"
                             );
                         }

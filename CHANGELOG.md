@@ -39,6 +39,9 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 - **Erase outcomes carry `receiptIds`** and report `scope` where an upload
   outcome reports `digest`. A whole-holder erasure previously answered
   `"digest": "all"`.
+- **A grant states its own `acceptedTermsId`.** A resumed grant may carry terms
+  older than the request asked for, and the committed snapshot pins the grant's
+  — so a client that wanted the newer ones can only tell by being told.
 
 ### Added
 
@@ -52,7 +55,12 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 - Error codes `upload_incomplete`, `upload_expired`, `upload_not_found`,
   `receipt_not_found`, `receipt_expired`.
 - A reconciliation sweep: orphaned bytes, expired grants, spent replay nonces,
-  aged outcomes and receipts.
+  aged outcomes, receipts and erased references.
+- `erasedReferences` in `metadataRetention`, bounding what is remembered about a
+  snapshot after its bytes are gone. `list` reports `erased` and a re-erase
+  answers `receipt_expired` only while it survives; past it both become "unknown
+  digest", which is the operator having genuinely forgotten rather than keeping
+  a permanent list of everything a holder erased.
 
 ### Fixed
 
@@ -64,6 +72,11 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 - **A crash mid-erase left a live row whose bytes were gone**, so `list`
   reported `retained` about a snapshot that no longer existed. Bookkeeping
   commits in one transaction and the bytes are unlinked after it.
+- **A live grant could be duplicated by a terms change.** Resume only fired when
+  the request's `acceptedTermsId` matched the grant's, so re-preflighting under
+  new terms fell past it and minted a *second* `uploadId` for the same digest —
+  two grants against one reference, both consuming quota, when only expiry is
+  supposed to release the first.
 - Quota was enforced only at preflight, so a holder could preflight N uploads
   against an unmoved count and commit them all.
 - Grant expiry was minted and stored and never compared to anything.

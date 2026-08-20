@@ -723,6 +723,20 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    /// Forget references erased longer ago than the declared window.
+    ///
+    /// The row is what lets `list` say `erased` and `/v1/erasures` say
+    /// `receipt_expired`; kept without limit it is a permanent list of
+    /// everything this holder has ever erased, which is a more complete
+    /// history than the backups themselves. So it is bounded, and both
+    /// of those answers end with it.
+    pub fn sweep_erased_references(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM snapshots WHERE erased_at IS NOT NULL AND erased_at < ?1",
+            [older_than],
+        )?)
+    }
+
     /// Drop receipts past the declared window.
     pub fn sweep_receipts(&self, older_than: &str) -> Result<usize> {
         // Coverage first, while the receipts it points at still exist

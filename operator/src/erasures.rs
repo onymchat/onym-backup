@@ -726,6 +726,7 @@ mod tests {
                 "2000-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
             )
         });
         assert_eq!(swept.orphan_snapshots, 0, "the sweep deleted a live snapshot");
@@ -870,6 +871,7 @@ mod tests {
                 "2000-01-01T00:00:00Z",
                 // Every receipt is now past its window.
                 "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
             )
         });
 
@@ -1051,6 +1053,7 @@ mod tests {
                 "2099-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
                 "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
             )
         });
@@ -1234,6 +1237,7 @@ mod tests {
                 "2000-01-01T00:00:00Z",
                 "2000-01-01T00:00:00Z",
                 "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
             )
         });
         assert_eq!(
@@ -1241,5 +1245,72 @@ mod tests {
             0,
             "coverage rows outlived the receipts they belong to"
         );
+    }
+
+    /// Every promise that rides on the erased reference ends with it.
+    ///
+    /// The row is what lets `list` say `erased` and a re-erase say
+    /// `receipt_expired`. Kept without limit it is a permanent list of
+    /// everything this holder has erased — a more complete history than
+    /// the backups. So it is bounded, and past the bound the operator
+    /// has genuinely forgotten rather than chosen to be coy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forgotten_erasure_stops_being_reported() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase(&harness, &digest).await;
+
+        // Receipts and the reference are both past their windows.
+        tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+            )
+        });
+
+        // Not `receipt_expired`: the operator no longer knows there was
+        // an erasure, and saying so would require the record it just
+        // discarded.
+        let (status, _) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // And `list` no longer carries the row either.
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        assert!(listed.as_array().unwrap().is_empty());
+    }
+
+    /// While the reference survives, the erasure is still reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remembered_erasure_is_still_receipt_expired() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase(&harness, &digest).await;
+
+        // Receipts gone; the reference kept.
+        tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            )
+        });
+
+        let (status, body) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"], "receipt_expired");
     }
 }
