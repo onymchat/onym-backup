@@ -103,32 +103,43 @@ valid_until="$(date -u -v+89d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
   || date -u -d '+89 days' +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "==> building provider manifest"
-python3 - <<PY
-import json
+PROVIDER_KEY="$provider_key" \
+VALID_UNTIL="$valid_until" \
+PRIVACY_DIGEST="$privacy_digest" \
+DISCOVERY_HOST="$DISCOVERY_HOST" \
+POLICY_DIGEST="$policy_digest" \
+OUT_MANIFEST_SRC="$out/manifest.src.json" \
+python3 - <<'PY'
+import json, os
 m = json.load(open("provider-manifest.src.json"))
-m["operator"] = "$provider_key"
-m["validUntil"] = "$valid_until"
-m["privacyProfile"] = "$privacy_digest"
-m["privacyProfileUri"] = "https://$DISCOVERY_HOST/privacy.md"
+m["operator"] = os.environ["PROVIDER_KEY"]
+m["validUntil"] = os.environ["VALID_UNTIL"]
+m["privacyProfile"] = os.environ["PRIVACY_DIGEST"]
+m["privacyProfileUri"] = f"https://{os.environ['DISCOVERY_HOST']}/privacy.md"
 c = m["catalogs"][0]
-c["snapshot"] = "https://$DISCOVERY_HOST/catalogs/backup-qa.json"
-c["policy"] = "$policy_digest"
-c["policyUri"] = "https://$DISCOVERY_HOST/policy.md"
-json.dump(m, open("$out/manifest.src.json", "w"), indent=2)
+c["snapshot"] = f"https://{os.environ['DISCOVERY_HOST']}/catalogs/backup-qa.json"
+c["policy"] = os.environ["POLICY_DIGEST"]
+c["policyUri"] = f"https://{os.environ['DISCOVERY_HOST']}/policy.md"
+json.dump(m, open(os.environ["OUT_MANIFEST_SRC"], "w"), indent=2)
 PY
 "$cli" sign-manifest --seed "$seed" "$out/manifest.src.json" --out "$out/manifest.json"
 rm "$out/manifest.src.json"
 
 echo "==> building catalog snapshot"
-python3 - <<PY
-import json
+POLICY_DIGEST="$policy_digest" \
+OPERATOR_COMPONENT="$operator_component" \
+OPERATOR_KEY="$operator_key" \
+OPERATOR_HOST="$OPERATOR_HOST" \
+LISTED_AT="$now" \
+python3 - <<'PY'
+import json, os
 c = json.load(open("catalog.config.json"))
-c["policyDigest"] = "$policy_digest"
+c["policyDigest"] = os.environ["POLICY_DIGEST"]
 e = c["entries"][0]
-e["componentId"] = "$operator_component"
-e["operator"] = "$operator_key"
-e["manifest"]["uri"] = "https://$OPERATOR_HOST/manifest.json"
-e["listedAt"] = "$now"
+e["componentId"] = os.environ["OPERATOR_COMPONENT"]
+e["operator"] = os.environ["OPERATOR_KEY"]
+e["manifest"]["uri"] = f"https://{os.environ['OPERATOR_HOST']}/manifest.json"
+e["listedAt"] = os.environ["LISTED_AT"]
 json.dump(c, open("catalog.config.resolved.json", "w"), indent=2)
 PY
 
