@@ -32,3 +32,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [dev-dependencies]
 # `oneshot` for router tests without binding a port.
 tower = { version = "0.4", features = ["util"] }
+tempdir = "0.3"

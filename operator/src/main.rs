@@ -18,6 +18,9 @@
 //!   are not, and none of them is aggregated per holder over time.
 
 mod api;
+mod uploads;
+mod auth;
+mod blobs;
 mod config;
 mod documents;
 mod error;
@@ -81,10 +84,16 @@ async fn main() {
     };
 
     let bind_addr = config.bind_addr.clone();
+    let blob_root = config.blob_root.clone();
+    if let Err(error) = std::fs::create_dir_all(&blob_root) {
+        eprintln!("could not create {blob_root}: {error}");
+        exit(1);
+    }
     let state = std::sync::Arc::new(api::AppState {
         config,
         documents,
         store: tokio::sync::Mutex::new(store),
+        blobs: blobs::Blobs::new(blob_root),
     });
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {

@@ -226,6 +226,102 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_upload(
+        &self,
+        upload_id: &str,
+        handle: &str,
+        operation_id: &str,
+        digest: &str,
+        sealed_byte_size: i64,
+        chunk_bytes: i64,
+        chunk_count: i64,
+        accepted_terms_id: &str,
+        started_at: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO uploads (upload_id, holder_handle, operation_id, digest,
+                sealed_byte_size, chunk_bytes, chunk_count, received_mask,
+                accepted_terms_id, started_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'', ?8, ?9, ?10)",
+            rusqlite::params![
+                upload_id, handle, operation_id, digest, sealed_byte_size,
+                chunk_bytes, chunk_count, accepted_terms_id, started_at, expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upload(&self, upload_id: &str) -> Result<Option<UploadRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
+                    chunk_bytes, chunk_count, accepted_terms_id
+             FROM uploads WHERE upload_id = ?1",
+        )?;
+        let mut rows = statement.query_map([upload_id], |row| {
+            Ok(UploadRow {
+                upload_id: row.get(0)?,
+                holder_handle: row.get(1)?,
+                operation_id: row.get(2)?,
+                digest: row.get(3)?,
+                sealed_byte_size: row.get(4)?,
+                chunk_bytes: row.get(5)?,
+                chunk_count: row.get(6)?,
+                accepted_terms_id: row.get(7)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn drop_upload(&self, upload_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM uploads WHERE upload_id = ?1", [upload_id])?;
+        Ok(())
+    }
+
+    /// Record a committed snapshot.
+    ///
+    /// `INSERT OR IGNORE`: a holder committing a digest they already
+    /// hold is `already_retained`, not a second row and not an
+    /// overwrite of bytes that are addressed by their own digest.
+    pub fn retain(&self, upload: &UploadRow, retained_at: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO snapshots (holder_handle, digest, algorithm,
+                sealed_byte_size, chunk_count, accepted_terms_id, retained_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                upload.holder_handle,
+                upload.digest,
+                crate::documents::DIGEST_SUITE,
+                upload.sealed_byte_size,
+                upload.chunk_count,
+                upload.accepted_terms_id,
+                retained_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Answer `/v1/operations/{id}` so a lost response is reconciled
+    /// rather than relabelled.
+    pub fn record_outcome(
+        &self,
+        operation_id: &str,
+        handle: &str,
+        digest: &str,
+        status: &str,
+        recorded_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO operation_outcomes
+                (operation_id, holder_handle, digest, status, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![operation_id, handle, digest, status, recorded_at],
+        )?;
+        Ok(())
+    }
+
     pub fn snapshot_exists(&self, handle: &str, digest: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM snapshots
@@ -235,6 +331,18 @@ impl Store {
         )?;
         Ok(count > 0)
     }
+}
+
+/// An upload in flight.
+pub struct UploadRow {
+    pub upload_id: String,
+    pub holder_handle: String,
+    pub operation_id: String,
+    pub digest: String,
+    pub sealed_byte_size: i64,
+    pub chunk_bytes: i64,
+    pub chunk_count: i64,
+    pub accepted_terms_id: String,
 }
 
 pub struct RetainedRow {
