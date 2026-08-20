@@ -71,9 +71,13 @@ impl Store {
                 chunk_count       INTEGER NOT NULL,
                 received_mask     BLOB NOT NULL,
                 accepted_terms_id TEXT NOT NULL,
+                supersedes        TEXT,
                 started_at        TEXT NOT NULL,
                 expires_at        TEXT NOT NULL
             );
+            -- Resuming a grant needs (holder, digest) to be findable.
+            CREATE INDEX IF NOT EXISTS uploads_by_digest
+                ON uploads (holder_handle, digest);
             CREATE INDEX IF NOT EXISTS uploads_by_holder
                 ON uploads (holder_handle, expires_at);
 
@@ -82,12 +86,20 @@ impl Store {
             -- is declared: keeping an operation id IS the per-holder
             -- timing trace §15 otherwise forbids, so it is a window
             -- measured in hours rather than an exception.
+            -- Keyed on (holder, operation) rather than operation
+            -- alone. The operation id is chosen by the client, so a
+            -- bare primary key would let one holder pick another's id
+            -- and silently replace their outcome row — breaking the
+            -- reconciliation this table exists to serve. Namespacing it
+            -- per holder makes the id a holder's own business, which is
+            -- what it always was.
             CREATE TABLE IF NOT EXISTS operation_outcomes (
-                operation_id  TEXT PRIMARY KEY,
+                operation_id  TEXT NOT NULL,
                 holder_handle TEXT NOT NULL,
                 digest        TEXT NOT NULL,
                 status        TEXT NOT NULL,
-                recorded_at   TEXT NOT NULL
+                recorded_at   TEXT NOT NULL,
+                PRIMARY KEY (holder_handle, operation_id)
             );
 
             -- Kept because §12 exports them and a holder may need to
@@ -226,6 +238,207 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_upload(
+        &self,
+        upload_id: &str,
+        handle: &str,
+        operation_id: &str,
+        digest: &str,
+        sealed_byte_size: i64,
+        chunk_bytes: i64,
+        chunk_count: i64,
+        accepted_terms_id: &str,
+        supersedes: Option<&str>,
+        started_at: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO uploads (upload_id, holder_handle, operation_id, digest,
+                sealed_byte_size, chunk_bytes, chunk_count, received_mask,
+                accepted_terms_id, supersedes, started_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, X'', ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                upload_id, handle, operation_id, digest, sealed_byte_size,
+                chunk_bytes, chunk_count, accepted_terms_id, supersedes,
+                started_at, expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upload(&self, upload_id: &str) -> Result<Option<UploadRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
+                    chunk_bytes, chunk_count, accepted_terms_id, supersedes, expires_at
+             FROM uploads WHERE upload_id = ?1",
+        )?;
+        let mut rows = statement.query_map([upload_id], |row| {
+            Ok(UploadRow {
+                upload_id: row.get(0)?,
+                holder_handle: row.get(1)?,
+                operation_id: row.get(2)?,
+                digest: row.get(3)?,
+                sealed_byte_size: row.get(4)?,
+                chunk_bytes: row.get(5)?,
+                chunk_count: row.get(6)?,
+                accepted_terms_id: row.get(7)?,
+                supersedes: row.get(8)?,
+                expires_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn drop_upload(&self, upload_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM uploads WHERE upload_id = ?1", [upload_id])?;
+        Ok(())
+    }
+
+    /// Record a committed snapshot.
+    ///
+    /// `INSERT OR IGNORE`: a holder committing a digest they already
+    /// hold is `already_retained`, not a second row and not an
+    /// overwrite of bytes that are addressed by their own digest.
+    pub fn retain(&self, upload: &UploadRow, retained_at: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO snapshots (holder_handle, digest, algorithm,
+                sealed_byte_size, chunk_count, accepted_terms_id, supersedes, retained_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                upload.holder_handle,
+                upload.digest,
+                crate::documents::DIGEST_SUITE,
+                upload.sealed_byte_size,
+                upload.chunk_count,
+                upload.accepted_terms_id,
+                upload.supersedes,
+                retained_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Answer `/v1/operations/{id}` so a lost response is reconciled
+    /// rather than relabelled.
+    pub fn record_outcome(
+        &self,
+        operation_id: &str,
+        handle: &str,
+        digest: &str,
+        status: &str,
+        recorded_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO operation_outcomes
+                (operation_id, holder_handle, digest, status, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![operation_id, handle, digest, status, recorded_at],
+        )?;
+        Ok(())
+    }
+
+    /// Grants this holder has open and has not let expire.
+    ///
+    /// Counted alongside retained snapshots at preflight. Quota checked
+    /// against retained rows alone is checked against a number that has
+    /// not moved yet: a holder one below the limit could preflight N
+    /// uploads, each seeing the same count, then commit all N. The
+    /// commit-time re-check is the authoritative gate; counting grants
+    /// here is what keeps the refusal *cheap*, which is the entire
+    /// reason preflight exists.
+    pub fn open_grants(&self, handle: &str, now: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM uploads
+                 WHERE holder_handle = ?1 AND expires_at > ?2",
+                rusqlite::params![handle, now],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// A grant this holder already holds for this digest, if one is
+    /// still live.
+    ///
+    /// Preflight returns it rather than minting a second. Without this
+    /// a holder whose grant response was lost re-preflights, is told
+    /// `quota_exceeded` by their own orphaned grant, and can do nothing
+    /// but wait for it to expire — the same reconciliation failure
+    /// `already_retained` avoids for the committed case, one step
+    /// earlier.
+    pub fn open_grant_for(
+        &self,
+        handle: &str,
+        digest: &str,
+        now: &str,
+    ) -> Result<Option<UploadRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
+                    chunk_bytes, chunk_count, accepted_terms_id, supersedes, expires_at
+             FROM uploads
+             WHERE holder_handle = ?1 AND digest = ?2 AND expires_at > ?3
+             ORDER BY expires_at DESC",
+        )?;
+        let mut rows = statement.query_map(rusqlite::params![handle, digest, now], |row| {
+            Ok(UploadRow {
+                upload_id: row.get(0)?,
+                holder_handle: row.get(1)?,
+                operation_id: row.get(2)?,
+                digest: row.get(3)?,
+                sealed_byte_size: row.get(4)?,
+                chunk_bytes: row.get(5)?,
+                chunk_count: row.get(6)?,
+                accepted_terms_id: row.get(7)?,
+                supersedes: row.get(8)?,
+                expires_at: row.get(9)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Upload ids whose grants have run out.
+    pub fn expired_uploads(&self, now: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT upload_id FROM uploads WHERE expires_at <= ?1")?;
+        let rows = statement.query_map([now], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
+    }
+
+    pub fn all_upload_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare("SELECT upload_id FROM uploads")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
+    }
+
+    /// Every live snapshot as `(holder_handle, digest-hex)` — the shape
+    /// the blob layer names them by, so the sweep can compare directly.
+    pub fn all_retained_keys(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT holder_handle, digest FROM snapshots WHERE erased_at IS NULL")?;
+        let rows = statement.query_map([], |row| {
+            let handle: String = row.get(0)?;
+            let digest: String = row.get(1)?;
+            Ok((
+                handle,
+                digest.strip_prefix("sha256:").unwrap_or(&digest).to_string(),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The raw connection, for tests that assert on table shape rather
+    /// than on behaviour — the primary key of `operation_outcomes` is
+    /// not observable through any method, and it is a property worth
+    /// asserting directly.
+    #[cfg(test)]
+    pub fn connection_for_tests(&self) -> &rusqlite::Connection {
+        &self.connection
+    }
+
     pub fn snapshot_exists(&self, handle: &str, digest: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM snapshots
@@ -235,6 +448,20 @@ impl Store {
         )?;
         Ok(count > 0)
     }
+}
+
+/// An upload in flight.
+pub struct UploadRow {
+    pub upload_id: String,
+    pub holder_handle: String,
+    pub operation_id: String,
+    pub digest: String,
+    pub sealed_byte_size: i64,
+    pub chunk_bytes: i64,
+    pub chunk_count: i64,
+    pub accepted_terms_id: String,
+    pub supersedes: Option<String>,
+    pub expires_at: String,
 }
 
 pub struct RetainedRow {

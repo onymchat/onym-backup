@@ -36,10 +36,11 @@ entitlement enforcement is a declared capability.
 
 ## Status
 
-Early. It boots, signs and serves its manifest, profile and terms, and
-holds the bookkeeping schema. The `/v1/` surface — preflight, chunked
-upload, list, download, erase, export — is being built against the
-profile's §9 route table.
+A snapshot can be stored and read back: preflight, chunked upload,
+commit, list, download, with quota and grant expiry enforced and a
+reconciliation sweep that deletes bytes no row accounts for. Erase with
+signed receipts, export, and outcome reconciliation are next, along
+with the entitlement path for operators that charge.
 
 ```
 BACKUP_COMPONENT_ID=onym:component:you \

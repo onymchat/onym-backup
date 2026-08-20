@@ -18,11 +18,15 @@
 //!   are not, and none of them is aggregated per holder over time.
 
 mod api;
+mod uploads;
+mod auth;
+mod blobs;
 mod config;
 mod documents;
 mod error;
 mod payload;
 mod store;
+mod sweep;
 
 use std::process::exit;
 
@@ -81,11 +85,80 @@ async fn main() {
     };
 
     let bind_addr = config.bind_addr.clone();
+    let blob_root = config.blob_root.clone();
+    if let Err(error) = std::fs::create_dir_all(&blob_root) {
+        eprintln!("could not create {blob_root}: {error}");
+        exit(1);
+    }
     let state = std::sync::Arc::new(api::AppState {
         config,
         documents,
         store: tokio::sync::Mutex::new(store),
+        blobs: blobs::Blobs::new(blob_root),
     });
+
+    // Reconcile before serving, then hourly. Bytes and rows are
+    // written in two steps, so a crash between them leaves one without
+    // the other; this deletes bytes with no row and never invents a row
+    // for bytes it found. It also collects grants that expired — the
+    // only bound on `incoming/` that does not depend on clients
+    // finishing what they start — and spent replay nonces.
+    //
+    // On the blocking pool, not the runtime: it walks every holder and
+    // digest under the blob root, and it takes the store lock in short
+    // bursts rather than across that walk. An hourly stall of every
+    // request is still a stall.
+    {
+        let state = state.clone();
+        let skew = state.config.max_skew_secs;
+        tokio::spawn(async move {
+            loop {
+                let state = state.clone();
+                let swept = tokio::task::spawn_blocking(move || {
+                    let stamp = |at: time::OffsetDateTime| {
+                        at.format(&time::format_description::well_known::Rfc3339)
+                    };
+                    let at = time::OffsetDateTime::now_utc();
+                    // Twice the skew window: it is two-sided, so a
+                    // signature stamped `max_skew` ahead stays
+                    // acceptable until `now + max_skew` and is live for
+                    // up to 2x from first sight. Sweeping at 1x would
+                    // drop it while still valid and reopen the replay
+                    // the table closes.
+                    let floor = at - time::Duration::seconds(skew * 2);
+                    match (stamp(at), stamp(floor)) {
+                        (Ok(now), Ok(floor)) => {
+                            Some(sweep::reconcile(&state.store, &state.blobs, &now, &floor))
+                        }
+                        _ => None,
+                    }
+                })
+                .await;
+
+                match swept {
+                    Ok(Some(swept)) => {
+                        if swept.expired_grants
+                            + swept.orphan_incoming
+                            + swept.orphan_snapshots
+                            + swept.spent_nonces
+                            > 0
+                        {
+                            tracing::info!(
+                                expired_grants = swept.expired_grants,
+                                orphan_incoming = swept.orphan_incoming,
+                                orphan_snapshots = swept.orphan_snapshots,
+                                spent_nonces = swept.spent_nonces,
+                                "swept"
+                            );
+                        }
+                    }
+                    Ok(None) => tracing::error!("could not stamp sweep"),
+                    Err(error) => tracing::error!(%error, "sweep task failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,

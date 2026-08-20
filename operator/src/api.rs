@@ -15,7 +15,8 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post, put};
 use axum::Router;
 use serde_json::json;
 
@@ -33,10 +34,17 @@ use crate::store::Store;
 /// route's larger bound unreachable.
 pub const MAX_JSON_BODY_BYTES: usize = 256 * 1024;
 
+/// The ceiling for a transfer chunk, which the grant then bounds
+/// further. Generous relative to the 8 MiB default so an operator can
+/// raise `BACKUP_CHUNK_BYTES` without editing code, and finite so an
+/// unauthenticated caller cannot choose our memory.
+pub const MAX_CHUNK_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct AppState {
     pub config: Config,
     pub documents: Documents,
     pub store: tokio::sync::Mutex<Store>,
+    pub blobs: crate::blobs::Blobs,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -45,6 +53,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/manifest.json", get(manifest))
         .route("/profile.json", get(profile))
         .route("/terms/:terms_file", get(terms))
+        .route("/v1/preflight", post(crate::uploads::preflight))
+        .route(
+            "/v1/uploads/:upload_id/chunks/:index",
+            // Raised past the JSON ceiling: a transfer chunk is bytes,
+            // and the grant is what bounds it.
+            put(crate::uploads::put_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
+        )
+        .route("/v1/uploads/:upload_id/commit", post(crate::uploads::commit))
+        .route("/v1/snapshots", get(crate::uploads::list))
+        .route("/v1/snapshots/:digest", get(crate::uploads::download))
         .with_state(state)
 }
 
@@ -121,19 +139,26 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn state() -> Arc<AppState> {
+    fn state() -> (Arc<AppState>, tempfile::TempDir) {
+        // A `TempDir` handed back with the state rather than a shared
+        // path under `temp_dir()`: these tests never touch blobs, but a
+        // fixed path shared across runs is the kind of thing that works
+        // until two run at once.
+        let dir = tempfile::TempDir::new().unwrap();
         let config = Config::for_tests("onym:component:test", vec![]);
         let signing = ed25519_dalek::SigningKey::from_bytes(&config.signing_seed);
         let documents = Documents::build(&config, &signing).unwrap();
-        Arc::new(AppState {
+        (Arc::new(AppState {
             config,
             documents,
             store: tokio::sync::Mutex::new(Store::in_memory().unwrap()),
-        })
+            blobs: crate::blobs::Blobs::new(dir.path()),
+        }), dir)
     }
 
     async fn get_status(path: &str) -> StatusCode {
-        router(state())
+        let (state, _dir) = state();
+        router(state)
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap()
@@ -149,7 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn terms_are_served_at_their_own_digest() {
-        let state = state();
+        let (state, _dir) = state();
         let hex = state.documents.terms.0.strip_prefix("sha256:").unwrap().to_string();
         assert_eq!(get_status(&format!("/terms/{hex}.json")).await, StatusCode::OK);
     }
@@ -159,7 +184,8 @@ mod tests {
     /// caller's snapshot never pinned.
     #[tokio::test]
     async fn unknown_terms_are_not_substituted() {
-        let response = router(state())
+        let (state, _dir) = state();
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .uri(format!("/terms/{}.json", "f".repeat(64)))
@@ -177,19 +203,28 @@ mod tests {
     /// otherwise.
     #[tokio::test]
     async fn there_is_no_administrative_route() {
-        for path in [
-            "/admin",
-            "/v1/admin",
-            "/v1/holders",
-            "/v1/holders/reset",
-            "/v1/snapshots/reassign",
-            "/internal",
-            "/debug",
-        ] {
+        // Paths that exist nowhere: a 404 is the whole answer.
+        for path in ["/admin", "/v1/admin", "/v1/holders", "/v1/holders/reset", "/internal", "/debug"] {
             assert_eq!(
                 get_status(path).await,
                 StatusCode::NOT_FOUND,
                 "{path} answered — an administrative surface appeared"
+            );
+        }
+
+        // And paths that *do* route, but only into the ordinary
+        // holder-scoped surface. `/v1/snapshots/reassign` is a download
+        // of a snapshot named "reassign": it refuses for want of a
+        // proof, which is the right refusal and not an administrative
+        // one. Asserting 404 here would have been asserting the router
+        // shape rather than the property, and it broke the moment a
+        // legitimate parameterised route was added — which is how it
+        // was noticed.
+        for path in ["/v1/snapshots/reassign", "/v1/snapshots/anything"] {
+            let status = get_status(path).await;
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::NOT_FOUND,
+                "{path} answered {status} — an unauthenticated caller got somewhere"
             );
         }
     }
@@ -203,13 +238,17 @@ mod tests {
         // so it cannot narrow silently as files are added — a guarantee
         // that quietly stops covering new code is worse than none,
         // because it still reads as covered.
-        let sources: [(&str, &str); 6] = [
+        let sources: [(&str, &str); 10] = [
             ("api", include_str!("api.rs")),
+            ("uploads", include_str!("uploads.rs")),
+            ("auth", include_str!("auth.rs")),
+            ("blobs", include_str!("blobs.rs")),
             ("config", include_str!("config.rs")),
             ("documents", include_str!("documents.rs")),
             ("error", include_str!("error.rs")),
             ("payload", include_str!("payload.rs")),
             ("store", include_str!("store.rs")),
+            ("sweep", include_str!("sweep.rs")),
         ];
 
         let declared: Vec<String> = include_str!("main.rs")
