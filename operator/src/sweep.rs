@@ -244,9 +244,22 @@ pub fn reconcile(
     // promised ends. Not the credential, not the `entitlementId`, not
     // the offer or the issuer — see `store::LapseState`.
     //
-    // Per holder rather than one statement over the table, so a
-    // derivation that fails leaves that holder's records in place
-    // rather than dropping them with nothing behind them.
+    // Two passes, because two different things are past the bound.
+    //
+    // Holders losing their *last* record need the horizon carried over
+    // first, so they are handled per holder: a derivation that fails
+    // leaves that holder's records in place rather than dropping them
+    // with nothing behind them.
+    //
+    // Everyone else — the ordinary renewing subscriber — needs no
+    // derivation at all, because the record they still hold already
+    // carries both horizons. Their expired prior credentials are swept
+    // in one statement below. **They were previously not swept at
+    // all**: the per-holder list is holders losing everything, and a
+    // renewer never is one, so every credential they had ever held
+    // survived indefinitely. §15 bounds each record at its own
+    // `expiresAt` plus one epoch interval, and that bound does not
+    // pause because the holder bought another month.
     //
     // **The step order no longer carries anything.** It used to: the
     // old floor was the last grace window plus one poll interval, so
@@ -267,6 +280,19 @@ pub fn reconcile(
     };
     for handle in losing {
         let store = store.blocking_lock();
+        // Re-checked under the lock this write goes through. The list
+        // above was read without it, and a `register_entitlement` that
+        // landed in between has already cleared this holder's derived
+        // state precisely because they have not lapsed — writing it
+        // back from a stale list would undo that.
+        match store.holder_losing_entitlements(&handle, entitlement_floor) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "could not re-check a holder losing entitlement records");
+                continue;
+            }
+        }
         let derived = match crate::lapse::derive_lapse_state(&store, &handle, revoked) {
             // Nothing retained, so nothing is owed a window: the record
             // goes and leaves no successor, which is the point of
@@ -294,6 +320,18 @@ pub fn reconcile(
         }
     }
 
+    // And every other record past the bound, whose holder is still
+    // entitled and needs nothing derived. One statement, and its
+    // subquery is the exact complement of the list above — so it cannot
+    // take the records of a holder whose derivation just failed.
+    match store
+        .blocking_lock()
+        .sweep_superseded_entitlements(entitlement_floor)
+    {
+        Ok(count) => swept.aged_entitlements += count,
+        Err(error) => tracing::warn!(%error, "could not sweep superseded entitlement records"),
+    }
+
     // (3c) Derived lifecycle state that has outlived its purpose.
     //
     // Retired only when the last window it records has closed *and*
@@ -316,12 +354,46 @@ pub fn reconcile(
         }
     };
     for (handle, state) in lapsed {
-        let closed = time::OffsetDateTime::parse(
+        let ends = time::OffsetDateTime::parse(
             &state.grace_expires_at,
             &time::format_description::well_known::Rfc3339,
-        )
-        .is_ok_and(|ends| now_at >= ends);
-        if !closed || state.post_grace_action != "erase" {
+        );
+        let Ok(ends) = ends else {
+            // A `grace_expires_at` that cannot be read is the one value
+            // in this row with no safe reading. Treating it as closed
+            // would retire the row mid-grace, which is the bug this
+            // whole step exists to prevent; treating it as open, which
+            // is what a bare `is_ok_and` did, keeps the row forever and
+            // says nothing — the only unbounded retention in the sweep,
+            // arrived at silently.
+            //
+            // So repair it instead. The row is derived state, and
+            // everything it was derived from is still here: `lapsed_at`
+            // plus the snapshots' own pinned terms. Re-deriving
+            // rewrites the bound, and a holder with nothing left to
+            // protect loses the row outright.
+            tracing::warn!(
+                grace_expires_at = %state.grace_expires_at,
+                "derived lapse state carries an unreadable window end; re-deriving it"
+            );
+            let store = store.blocking_lock();
+            match crate::lapse::derive_lapse_state(&store, &handle, revoked) {
+                Ok(Some(fresh)) => {
+                    if let Err(error) = store.record_lapse_state(&handle, &fresh) {
+                        tracing::warn!(%error, "could not repair derived lapse state");
+                    }
+                }
+                Ok(None) => match store.forget_lapse_state(&handle) {
+                    Ok(count) => swept.forgotten_lapse_state += count,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not forget derived lapse state")
+                    }
+                },
+                Err(error) => tracing::warn!(%error, "could not repair derived lapse state"),
+            }
+            continue;
+        };
+        if now_at < ends || state.post_grace_action != "erase" {
             continue;
         }
         let store = store.blocking_lock();

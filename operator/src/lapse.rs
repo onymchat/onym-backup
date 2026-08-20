@@ -205,28 +205,18 @@ pub fn evaluate(
     }
 
     let revoked = state.revocation.revoked();
-    let Some(horizon) = store.entitlement_horizon(&holder.handle, &revoked)? else {
-        // No record. Either they never paid, or the records aged out at
-        // §15's bound — in which case the derived lifecycle state is
-        // what still knows when the grace they were promised runs out.
-        let Some(state) = store.lapse_state(&holder.handle)? else {
-            return Ok(if store.has_entitlement_record(&holder.handle)? {
-                Access::Lapsed
-            } else {
-                Access::Unpaid
-            });
-        };
-        let lapsed_at = OffsetDateTime::parse(&state.lapsed_at, &Rfc3339)
-            .map_err(|e| Error::Internal(format!("derived lapse timestamp: {e}")))?;
-        return grace_from(store, holder, lapsed_at, now);
-    };
 
     // **Access** is the unrevoked answer, and only that. A revoked
     // record contributes nothing here however far its own `expiresAt`
     // still is: revocation blocks new paid work from the moment the
-    // epoch says so.
-    if let Some(access) = &horizon.access {
-        let expires_at = OffsetDateTime::parse(access, &Rfc3339)
+    // epoch says so. Nothing else in this function reads the record
+    // directly — the horizon below comes from `lifecycle_horizon`, so
+    // the fallback lives in exactly one place.
+    if let Some(access) = store
+        .entitlement_horizon(&holder.handle, &revoked)?
+        .and_then(|horizon| horizon.access)
+    {
+        let expires_at = OffsetDateTime::parse(&access, &Rfc3339)
             .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
         if now < expires_at {
             // Registered, unexpired, just not attached to this request.
@@ -235,13 +225,25 @@ pub fn evaluate(
     }
 
     // **Lifecycle** is the answer across every record, revoked
-    // included. The terms a snapshot was accepted under still govern
-    // it, so grace is derived from the latest `expiresAt` a credential
-    // declared rather than from the moment revocation was noticed — or
+    // included, and after §15's bound has taken the records it is the
+    // derived state — one function decides which, for this path and for
+    // the sweep's. The terms a snapshot was accepted under still govern
+    // it, so grace runs from the latest `expiresAt` a credential
+    // declared rather than from the moment revocation was noticed, or
     // from an older unrevoked record that happened to be the only one
     // access could see.
-    let lapsed_at = OffsetDateTime::parse(&horizon.lifecycle, &Rfc3339)
-        .map_err(|e| Error::Internal(format!("stored entitlement expiry: {e}")))?;
+    //
+    // That costs a second read of the same indexed row on the request
+    // path. Cheap, and the alternative is this function knowing the
+    // fallback rule too — which is how `evaluate` and the sweep drift
+    // into disagreeing about whether a holder is still in grace.
+    let Some(lapsed_at) = lifecycle_horizon(store, &holder.handle, &revoked)? else {
+        return Ok(if store.has_entitlement_record(&holder.handle)? {
+            Access::Lapsed
+        } else {
+            Access::Unpaid
+        });
+    };
     grace_from(store, holder, lapsed_at, now)
 }
 
@@ -625,6 +627,129 @@ mod tests {
             .unwrap();
     }
 
+    /// Register a bare entitlement record directly.
+    ///
+    /// The verifier would refuse most of these — that is the point. The
+    /// question here is what the *store* keeps and for how long, and a
+    /// credential that was legitimately registered a year ago is
+    /// indistinguishable from this one by the time its bound falls due.
+    async fn record(harness: &Harness, id: &str, expires_at: OffsetDateTime) {
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .connection_for_tests()
+            .execute(
+                "INSERT INTO holder_entitlements
+                    (entitlement_id, holder_handle, offer_id, not_before, expires_at,
+                     quota_units, quota_unit, quota_consumed, raw, registered_at)
+                 VALUES (?1, ?2, 'backup-monthly-v1', '2020-01-01T00:00:00Z', ?3,
+                         NULL, NULL, 0, X'00', '2020-01-01T00:00:00Z')",
+                rusqlite::params![id, harness.handle(), expires_at.format(&Rfc3339).unwrap()],
+            )
+            .unwrap();
+    }
+
+    /// Every entitlement id this operator is still holding a credential
+    /// for, which is the only honest way to ask whether §15's bound was
+    /// enforced: the declaration is about the record, not the horizon.
+    async fn held_records(harness: &Harness) -> Vec<String> {
+        let store = harness.state.store.lock().await;
+        let connection = store.connection_for_tests();
+        let mut statement = connection
+            .prepare("SELECT entitlement_id FROM holder_entitlements ORDER BY entitlement_id")
+            .unwrap();
+        let rows = statement.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+    }
+
+    /// One pass of the real sweep, at the real entitlement floor.
+    fn sweep_now(harness: &Harness, revoked: &HashSet<String>) -> crate::sweep::Swept {
+        let poll = crate::config::Config::for_tests("onym:component:test", vec![])
+            .revocation_poll_secs as i64;
+        let at = OffsetDateTime::now_utc();
+        tokio::task::block_in_place(|| {
+            let floor = record_floor(poll, at).unwrap().format(&Rfc3339).unwrap();
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blob_mutations,
+                &harness.state.blobs,
+                revoked,
+                at,
+                crate::sweep::Cutoffs {
+                    now: &at.format(&Rfc3339).unwrap(),
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    receipt: "2000-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                    entitlement: &floor,
+                },
+            )
+        })
+    }
+
+    /// §15 bounds each *record* at its own `expiresAt` plus one epoch
+    /// interval. That bound does not pause because the holder bought
+    /// another month.
+    ///
+    /// The sweep used to run only over holders losing their *last*
+    /// record, and an ordinary renewing subscriber never is one — so
+    /// every credential they had ever held survived indefinitely, `raw`
+    /// bytes and `offerId` included. The per-holder payment diary this
+    /// operator refuses to keep, arrived at by only ever sweeping the
+    /// holders who had stopped paying.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewing_holder_does_not_accumulate_their_old_credentials() {
+        let (harness, snapshot, _) = holder_with_a_snapshot().await;
+        let now = OffsetDateTime::now_utc();
+        // Two prior months, long past their bound, behind the live
+        // `ent-1` that `holder_with_a_snapshot` registered 30 days out.
+        record(&harness, "ent-old-1", now - time::Duration::days(60)).await;
+        record(&harness, "ent-old-2", now - time::Duration::days(30)).await;
+        assert_eq!(held_records(&harness).await.len(), 3);
+
+        let swept = sweep_now(&harness, &HashSet::new());
+        assert_eq!(
+            swept.aged_entitlements, 2,
+            "a still-entitled holder's expired credentials were never swept"
+        );
+        assert_eq!(
+            held_records(&harness).await,
+            vec!["ent-1".to_string()],
+            "the operator kept a credential past §15's bound because its holder renewed"
+        );
+
+        // And nothing was derived for them: the record they still hold
+        // carries both horizons, so a `LapseState` would be a lapse
+        // that has not happened.
+        assert!(
+            harness
+                .state
+                .store
+                .lock()
+                .await
+                .lapse_state(&harness.handle())
+                .unwrap()
+                .is_none(),
+            "a paying holder was given a lapse record"
+        );
+
+        // Still entitled, and still holding what they uploaded — the
+        // sweep took records, not access.
+        let terms = harness.terms_id();
+        let fresh: Vec<u8> = (100..120u8).collect();
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&fresh, &terms))
+            .await;
+        assert_eq!(status, StatusCode::OK, "sweeping old records ended a live seat");
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     /// §10.3, both halves at once: what the terms promise during grace
     /// stays open, and the upload path does not — because a lapsed
     /// holder is not owed new retention by any snapshot's terms.
@@ -1005,24 +1130,12 @@ mod tests {
         lapsed_days_ago(&harness, 1).await;
         // `ent-2` is a renewal that was refunded: revoked, and declaring
         // an `expiresAt` twenty days out.
-        let renewal_expiry = (OffsetDateTime::now_utc() + time::Duration::days(20))
-            .format(&Rfc3339)
-            .unwrap();
-        harness
-            .state
-            .store
-            .lock()
-            .await
-            .connection_for_tests()
-            .execute(
-                "INSERT INTO holder_entitlements
-                    (entitlement_id, holder_handle, offer_id, not_before, expires_at,
-                     quota_units, quota_unit, quota_consumed, raw, registered_at)
-                 VALUES ('ent-2', ?1, 'backup-monthly-v1', '2020-01-01T00:00:00Z', ?2,
-                         NULL, NULL, 0, X'00', '2020-01-01T00:00:00Z')",
-                rusqlite::params![harness.handle(), renewal_expiry],
-            )
-            .unwrap();
+        record(
+            &harness,
+            "ent-2",
+            OffsetDateTime::now_utc() + time::Duration::days(20),
+        )
+        .await;
         let now = OffsetDateTime::now_utc();
         harness.state.revocation.install(
             crate::revocation::Epoch {
@@ -1032,6 +1145,31 @@ mod tests {
                 raw: Vec::new(),
             },
             now,
+        );
+
+        // `ent-1` is past its own §15 bound, and the sweep collects it
+        // even though its holder still holds `ent-2` — the bound is per
+        // record. Asserted here because this is the shape that used to
+        // slip through: the holder is not losing every record, so the
+        // per-holder path never looked at them.
+        let swept = sweep_now(&harness, &harness.state.revocation.revoked());
+        assert_eq!(swept.aged_entitlements, 1);
+        assert_eq!(
+            held_records(&harness).await,
+            vec!["ent-2".to_string()],
+            "an expired credential outlived its bound behind a live one"
+        );
+        // No derived state either: the surviving record still carries
+        // both horizons, which is why none is needed.
+        assert!(
+            harness
+                .state
+                .store
+                .lock()
+                .await
+                .lapse_state(&harness.handle())
+                .unwrap()
+                .is_none()
         );
 
         // **Access** is refused. The only unrevoked record expired

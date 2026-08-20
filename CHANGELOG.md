@@ -143,7 +143,14 @@ enrolment, and this file exists so the boundary is visible when it arrives.
   snapshot was never expired and the bytes were held indefinitely. The
   horizon now outlives the record instead of the record outliving its
   bound — see `lapseState` under Added. Records themselves go at §15's
-  bound, `expiresAt` plus one revocation-epoch interval.
+  bound, `expiresAt` plus one revocation-epoch interval, **per record
+  rather than per holder**: an expired prior credential is collected
+  whether or not its holder has since renewed. Bounding it per holder
+  instead would mean an ordinary subscriber accumulating every
+  credential they had ever held — `raw` bytes, `entitlementId` and
+  `offerId` — for as long as they kept paying, which is the per-holder
+  payment diary §15 exists to prevent, reached by only ever sweeping
+  the holders who had stopped.
 - **`metadataRetention.entitlementRecords` is a duration** (`PT15M` by
   default), read as a window past `expiresAt` the way §15 reads the
   column and `uploadGrants` already declares it. It was prose, and both

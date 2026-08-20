@@ -655,13 +655,20 @@ impl Store {
     }
 
     /// Holders whose every entitlement record is below the floor, and
-    /// which the next `sweep_entitlements` will therefore leave with
-    /// nothing.
+    /// which the next sweep will therefore leave with nothing.
     ///
     /// `HAVING MAX(...)` rather than a per-row test: a holder with one
     /// old record and one current one is not losing their horizon, and
     /// deriving lapse state for them would write a lapse that has not
     /// happened.
+    ///
+    /// **This selects who needs a `LapseState` written, and nothing
+    /// else.** It is emphatically not the set whose records may be
+    /// deleted — see `sweep_superseded_entitlements`, which handles
+    /// everyone this query excludes. Reading it as both is what let an
+    /// ordinary renewing subscriber keep every credential they had ever
+    /// held: one above-floor record took the whole holder out of the
+    /// sweep, so the expired ones behind it were never collected.
     pub fn holders_losing_entitlements(&self, older_than: &str) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
             "SELECT holder_handle FROM holder_entitlements
@@ -670,6 +677,74 @@ impl Store {
         )?;
         let rows = statement.query_map([older_than], |row| row.get(0))?;
         rows.collect::<std::result::Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Whether this holder is *still* losing every record, re-checked
+    /// under the lock the caller is about to write through.
+    ///
+    /// The sweep lists holders and then takes the store lock per holder,
+    /// so a `register_entitlement` can land in between. That call clears
+    /// the holder's derived lapse state precisely because a holder
+    /// presenting a live credential has not lapsed — and the sweep,
+    /// working from its stale list, would write the row straight back.
+    /// Nothing reads it while a record exists, so the damage is a
+    /// contradiction rather than a misbehaviour, but the invariant
+    /// `forget_lapse_state` states is worth actually holding.
+    ///
+    /// Requires at least one record as well as no above-floor one: a
+    /// holder whose records vanished entirely between the two steps is
+    /// not a holder this pass has anything to derive for.
+    pub fn holder_losing_entitlements(&self, handle: &str, older_than: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(CASE WHEN julianday(expires_at) >= julianday(?2)
+                                             THEN 1 END)
+                   FROM holder_entitlements WHERE holder_handle = ?1",
+                rusqlite::params![handle, older_than],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map(|(total, current)| total > 0 && current == 0)
+            .map_err(Into::into)
+    }
+
+    /// Records past the bound belonging to holders who still hold a
+    /// current one.
+    ///
+    /// §15 bounds each *record* at its own `expiresAt` plus one
+    /// revocation-epoch interval. That bound does not pause because the
+    /// holder later bought another month, and this is the statement
+    /// that says so: an expired prior credential is swept whether or not
+    /// its holder is still entitled.
+    ///
+    /// **Without it a renewing subscriber accumulated every credential
+    /// they had ever held, indefinitely** — `raw` bytes, `entitlementId`
+    /// and `offerId` — because the only sweep ran over holders losing
+    /// their *last* record, and a renewer never is one. That is the
+    /// per-holder payment diary §15 exists to prevent, arrived at by
+    /// sweeping only the holders who had stopped paying.
+    ///
+    /// No `LapseState` is derived for these holders and none is needed:
+    /// the surviving above-floor record already carries both horizons.
+    /// `lifecycle` is the MAX across records, so a sub-floor one cannot
+    /// be it; and a sub-floor record has expired by definition, so it
+    /// contributes nothing to `access` either.
+    ///
+    /// The `IN (...)` subquery is the exact complement of
+    /// `holders_losing_entitlements`, evaluated inside the same
+    /// statement. That matters for more than tidiness: it cannot touch
+    /// a holder whose derivation the caller has just deferred after a
+    /// failure, because such a holder is by definition losing every
+    /// record and so is not in this set.
+    pub fn sweep_superseded_entitlements(&self, older_than: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM holder_entitlements
+             WHERE julianday(expires_at) < julianday(?1)
+               AND holder_handle IN (
+                   SELECT holder_handle FROM holder_entitlements
+                   GROUP BY holder_handle
+                   HAVING MAX(julianday(expires_at)) >= julianday(?1))",
+            [older_than],
+        )?)
     }
 
     /// Persist the derived lifecycle state for a lapsed holder.
@@ -791,7 +866,9 @@ impl Store {
     /// what was bought or from whom — and the full record goes on time.
     /// Scoped to one holder, because the caller has just written that
     /// holder's successor state and a table-wide `DELETE` would take
-    /// the records of holders it has not written one for.
+    /// the records of holders it has not written one for. Half of a
+    /// pair: this collects the records of holders losing every one,
+    /// `sweep_superseded_entitlements` collects everyone else's.
     pub fn sweep_entitlements(&self, handle: &str, older_than: &str) -> Result<usize> {
         Ok(self.connection.execute(
             "DELETE FROM holder_entitlements
