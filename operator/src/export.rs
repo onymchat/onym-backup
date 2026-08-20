@@ -56,18 +56,24 @@ use crate::error::{Error, Resource, Result};
 /// `GET /v1/exports` — the container manifest.
 pub async fn manifest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response> {
     let now = OffsetDateTime::now_utc();
-    let (snapshots, receipts) = {
+    let (snapshots, receipts, receipt_terms) = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "GET", "/v1/exports", b"", &state.config, &store, now)?;
         (
             store.snapshots(&holder.handle)?,
             store.receipts(&holder.handle)?,
+            store.receipt_terms_ids(&holder.handle)?,
         )
     };
 
+    // Live snapshots *and* the receipts' terms. A receipt pins the
+    // terms of a snapshot that is gone, so collecting from live
+    // snapshots alone ships a receipt citing a document the container
+    // does not carry.
     let mut terms_ids: Vec<String> = snapshots
         .iter()
         .map(|row| row.accepted_terms_id.clone())
+        .chain(receipt_terms)
         .collect();
     terms_ids.sort();
     terms_ids.dedup();

@@ -43,6 +43,14 @@ pub struct UploadGrant {
     pub chunk_bytes: i64,
     pub chunk_count: i64,
     pub expires_at: String,
+    /// What has not arrived, as inclusive `[first, last]` ranges.
+    ///
+    /// Present on a fresh grant too, as one range covering everything,
+    /// so a resuming client needs no special case. Without it the only
+    /// way to learn progress is a commit expected to fail — which
+    /// works, and which every implementer would discover separately
+    /// and none would write down.
+    pub missing_chunks: Vec<(i64, i64)>,
 }
 
 /// The cheap refusal point.
@@ -150,11 +158,23 @@ pub async fn preflight(
     // orphan counting against the quota, and the holder can do nothing
     // about it but wait for it to expire.
     if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
+        // Two byte counts for one digest is a contradiction, and
+        // choosing between them is not the operator's job. `supersedes`
+        // is different: the grant keeps what it was minted with, since
+        // refusing would strand the holder until expiry holding quota
+        // headroom they cannot release.
+        if open.sealed_byte_size != reference.sealed_byte_size {
+            return Err(Error::BadRequest(
+                "sealedByteSize disagrees with the open grant for this digest".into(),
+            ));
+        }
+        let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
         return Ok(axum::Json(UploadGrant {
             upload_id: open.upload_id,
             chunk_bytes: open.chunk_bytes,
             chunk_count: open.chunk_count,
             expires_at: open.expires_at,
+            missing_chunks: missing,
         })
         .into_response());
     }
@@ -175,7 +195,7 @@ pub async fn preflight(
     // re-checks and is the authoritative gate; counting grants here is
     // what keeps the refusal cheap, which is why preflight exists.
     let (retained, retained_bytes) = store.usage(&holder.handle)?;
-    let open_grants = store.open_grants(&holder.handle, &now_stamp)?;
+    let (open_grants, open_grant_bytes) = store.open_grants(&holder.handle, &now_stamp)?;
     if retained + open_grants >= state.config.maximum_retained_snapshots {
         return Err(Error::QuotaExceeded {
             retained_snapshots: retained,
@@ -184,6 +204,7 @@ pub async fn preflight(
             limit_bytes: state.config.maximum_sealed_snapshot_bytes
                 * state.config.maximum_retained_snapshots,
             open_grants,
+            open_grant_bytes,
         });
     }
 
@@ -214,6 +235,9 @@ pub async fn preflight(
         chunk_bytes,
         chunk_count,
         expires_at,
+        // Nothing has arrived, so one range covers it — the same shape
+        // a resume returns, so a client branches on neither.
+        missing_chunks: vec![(0, chunk_count - 1)],
     })
     .into_response())
 }
@@ -376,6 +400,7 @@ pub async fn commit(
                     // This grant is the one being committed, so it is
                     // no longer headroom anybody is waiting on.
                     open_grants: 0,
+                    open_grant_bytes: 0,
                 });
             }
         }
@@ -959,7 +984,7 @@ pub mod tests {
             let digest: String = store
                 .connection_for_tests()
                 .query_row(
-                    "SELECT digest FROM operation_outcomes WHERE holder_handle = ?1",
+                    "SELECT subject FROM operation_outcomes WHERE holder_handle = ?1",
                     [&harness.handle()],
                     |row| row.get(0),
                 )
@@ -1008,6 +1033,10 @@ pub mod tests {
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["retainedSnapshots"], json!(0), "nothing is retained yet");
         assert_eq!(error["openGrants"], json!(2), "the grants are invisible");
+        assert_eq!(
+            error["openGrantBytes"], json!(40),
+            "a holder refused on bytes cannot see what consumed them"
+        );
         assert_eq!(error["maximumRetainedSnapshots"], json!(2));
     }
 
@@ -1140,6 +1169,7 @@ pub mod tests {
         assert_eq!(status, StatusCode::OK, "a re-preflight was refused");
         let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
         assert_eq!(second["uploadId"], first["uploadId"], "a second grant was minted");
+        assert_eq!(second["expiresAt"], first["expiresAt"], "the deadline was extended");
 
         // And the quota was not spent twice: with a limit of two, a
         // different snapshot still fits.
@@ -1148,6 +1178,57 @@ pub mod tests {
             .send("POST", "/v1/preflight", harness.preflight_body(&other, &terms))
             .await;
         assert_eq!(status, StatusCode::OK, "the duplicate grant consumed the quota");
+    }
+
+    /// A resumed grant says what has arrived, so the client does not
+    /// have to learn it by sending a commit it expects to fail.
+    #[tokio::test]
+    async fn a_resumed_grant_reports_what_is_missing() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let (_, first) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        // A fresh grant reports everything missing, as one range, so a
+        // client needs no special case for the two paths.
+        assert_eq!(first["missingChunks"], json!([[0, 2]]));
+        let upload_id = first["uploadId"].as_str().unwrap().to_string();
+
+        harness
+            .send("PUT", &format!("/v1/uploads/{upload_id}/chunks/0"), snapshot[..8].to_vec())
+            .await;
+        let (_, resumed) = harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+        let resumed: serde_json::Value = serde_json::from_slice(&resumed).unwrap();
+        assert_eq!(resumed["uploadId"], json!(upload_id));
+        assert_eq!(
+            resumed["missingChunks"],
+            json!([[1, 2]]),
+            "the resumed grant does not say what arrived"
+        );
+    }
+
+    /// Two byte counts for one digest is a contradiction, and choosing
+    /// between them is not the operator's job.
+    #[tokio::test]
+    async fn a_resume_with_a_different_size_is_refused() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        harness
+            .send("POST", "/v1/preflight", harness.preflight_body(&snapshot, &terms))
+            .await;
+
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&harness.preflight_body(&snapshot, &terms)).unwrap();
+        body["snapshotReference"]["sealedByteSize"] = json!(999);
+        let (status, _) = harness
+            .send("POST", "/v1/preflight", serde_json::to_vec(&body).unwrap())
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// A commit sent one chunk early costs one chunk, not the snapshot.

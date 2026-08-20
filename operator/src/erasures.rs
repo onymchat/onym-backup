@@ -88,6 +88,17 @@ pub async fn erase(
             // `list` avoids by reporting `erased`.
             let existing = store.receipts_for_scope(&holder.handle, &request.scope)?;
             if !existing.is_empty() {
+                // The retry's own operation id is recorded too, so a
+                // client that retries with a fresh id and loses *that*
+                // response can still reconcile it. Otherwise the retry
+                // path is the one operation §9.8 cannot answer for.
+                store.record_outcome(
+                    &request.operation_id,
+                    &holder.handle,
+                    &request.scope,
+                    "erased",
+                    &stamp,
+                )?;
                 return Ok(axum::Json(decode_receipts(existing)?).into_response());
             }
             // Never held, so there is nothing to commit to. A receipt
@@ -125,6 +136,20 @@ pub async fn erase(
         pinned.dedup();
 
         for terms_id in pinned {
+            // Re-checked under the lock. The lock is dropped for the
+            // blob work, so two erases of one scope can both have found
+            // live targets; without this each mints a fresh receipt and
+            // a later retry hands back both, which would make the
+            // receipt count a record of concurrency rather than of
+            // erasures.
+            if let Some(raw) = store.receipt_for(&holder.handle, &scope, &terms_id)? {
+                receipts.push(
+                    serde_json::from_slice(&raw)
+                        .map_err(|e| Error::Internal(format!("stored receipt: {e}")))?,
+                );
+                continue;
+            }
+
             let (raw, _) = store
                 .terms_document(&terms_id)?
                 .ok_or(Error::NotFound(Resource::Terms))?;
@@ -605,4 +630,138 @@ mod tests {
     }
 
     use tower::ServiceExt;
+
+    /// Erase, then store the same snapshot again.
+    ///
+    /// This is the migration flow `export.rs` advertises — the same
+    /// sealed bytes re-uploaded under the same reference — and it is
+    /// also just a holder changing their mind. The erased row keeps the
+    /// `(holder, digest)` primary key, so a re-upload must revive it
+    /// rather than being silently ignored by `INSERT OR IGNORE` while
+    /// the operator answers `retained`.
+    #[tokio::test]
+    async fn a_snapshot_can_be_stored_again_after_being_erased() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+        erase(&harness, &digest).await;
+
+        let (status, body) = harness.store_snapshot(&snapshot).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["outcome"]["status"], "retained");
+
+        // The word has to be true. Reporting `retained` for bytes that
+        // cannot be read back is worse than refusing the upload.
+        let (status, bytes) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the operator said retained and stored nothing");
+        assert_eq!(bytes, snapshot);
+
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        assert_eq!(listed.as_array().unwrap()[0]["status"], "retained");
+    }
+
+    /// And the sweep must not then delete what was just committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sweep_keeps_a_snapshot_restored_after_erasure() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+        erase(&harness, &digest).await;
+        harness.store_snapshot(&snapshot).await;
+
+        let swept = tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            )
+        });
+        assert_eq!(swept.orphan_snapshots, 0, "the sweep deleted a live snapshot");
+
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+        let (status, _) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A whole-holder erasure's outcome is a scope, not a digest.
+    /// Reporting `"digest": "all"` would be a scope wearing a digest's
+    /// name, which a client parsing the field would take literally.
+    #[tokio::test]
+    async fn an_erasure_outcome_reports_a_scope() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        erase_as(&harness, "all", "op-all").await;
+
+        let (status, body) = harness.send("GET", "/v1/operations/op-all", vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        let outcome: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["outcome"]["scope"], "all");
+        assert!(
+            outcome["outcome"]["digest"].is_null(),
+            "an erasure scope was reported as a digest"
+        );
+    }
+
+    /// A retry with a fresh operation id must be reconcilable too —
+    /// otherwise the retry path is the one operation §9.8 cannot
+    /// answer for, which is the path most likely to need it.
+    #[tokio::test]
+    async fn a_retried_erasure_records_its_own_operation_id() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        erase_as(&harness, &digest, "op-first").await;
+        let (status, _) = erase_as(&harness, &digest, "op-retry").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = harness.send("GET", "/v1/operations/op-retry", vec![]).await;
+        assert_eq!(status, StatusCode::OK, "the retry could not be reconciled");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["outcome"]["status"],
+            "erased"
+        );
+    }
+
+    /// A receipt cites the terms of a snapshot that is gone, so the
+    /// container has to carry those terms even when no live snapshot
+    /// pins them. Otherwise the container ships a receipt whose pin has
+    /// no preimage — by the one route the module doc was not watching.
+    #[tokio::test]
+    async fn the_container_carries_the_terms_a_receipt_pins() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        erase(&harness, "all").await;
+
+        let (_, body) = harness.send("GET", "/v1/exports", vec![]).await;
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            manifest["snapshots"].as_array().unwrap().is_empty(),
+            "nothing is live, which is the case that breaks"
+        );
+        assert_eq!(manifest["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            manifest["terms"].as_array().unwrap().len(),
+            1,
+            "the receipt's terms are not in the container"
+        );
+        assert_eq!(
+            manifest["terms"][0]["termsId"],
+            json!(harness.terms_id())
+        );
+    }
 }

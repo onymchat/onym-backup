@@ -96,7 +96,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS operation_outcomes (
                 operation_id  TEXT NOT NULL,
                 holder_handle TEXT NOT NULL,
-                digest        TEXT NOT NULL,
+                -- What the operation was about: a digest for an upload,
+                -- an erasure scope for an erase. Named for what it
+                -- holds rather than for the first thing that went in
+                -- it — as `digest` it reported "all" for a whole-holder
+                -- erasure, which is a scope wearing a digest's name.
+                subject       TEXT NOT NULL,
                 status        TEXT NOT NULL,
                 recorded_at   TEXT NOT NULL,
                 PRIMARY KEY (holder_handle, operation_id)
@@ -336,14 +341,34 @@ impl Store {
 
     /// Record a committed snapshot.
     ///
-    /// `INSERT OR IGNORE`: a holder committing a digest they already
-    /// hold is `already_retained`, not a second row and not an
-    /// overwrite of bytes that are addressed by their own digest.
+    /// An upsert, not `INSERT OR IGNORE`. A row survives its bytes —
+    /// erasure marks rather than deletes, so `list` can report `erased`
+    /// — and that row keeps the `(holder, digest)` primary key. With
+    /// `INSERT OR IGNORE`, re-uploading a digest the holder had erased
+    /// was silently dropped while the operator answered `retained`:
+    /// the bytes landed, `erased_at` stayed set, the download 404'd,
+    /// and the sweep then deleted the freshly committed bytes as
+    /// orphans. That is the migration flow §12 advertises — the same
+    /// sealed bytes under the same reference — failing while claiming
+    /// to work.
+    ///
+    /// So the conflict clears `erased_at` and refreshes what the new
+    /// upload pinned. A *live* row is still left alone: committing a
+    /// digest already held is `already_retained`, not an overwrite of
+    /// bytes that are addressed by their own digest.
     pub fn retain(&self, upload: &UploadRow, retained_at: &str) -> Result<()> {
         self.connection.execute(
-            "INSERT OR IGNORE INTO snapshots (holder_handle, digest, algorithm,
+            "INSERT INTO snapshots (holder_handle, digest, algorithm,
                 sealed_byte_size, chunk_count, accepted_terms_id, supersedes, retained_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (holder_handle, digest) DO UPDATE SET
+                 erased_at         = NULL,
+                 retained_at       = excluded.retained_at,
+                 accepted_terms_id = excluded.accepted_terms_id,
+                 supersedes        = excluded.supersedes,
+                 sealed_byte_size  = excluded.sealed_byte_size,
+                 chunk_count       = excluded.chunk_count
+             WHERE snapshots.erased_at IS NOT NULL",
             rusqlite::params![
                 upload.holder_handle,
                 upload.digest,
@@ -364,15 +389,15 @@ impl Store {
         &self,
         operation_id: &str,
         handle: &str,
-        digest: &str,
+        subject: &str,
         status: &str,
         recorded_at: &str,
     ) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO operation_outcomes
-                (operation_id, holder_handle, digest, status, recorded_at)
+                (operation_id, holder_handle, subject, status, recorded_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![operation_id, handle, digest, status, recorded_at],
+            rusqlite::params![operation_id, handle, subject, status, recorded_at],
         )?;
         Ok(())
     }
@@ -386,13 +411,13 @@ impl Store {
     /// commit-time re-check is the authoritative gate; counting grants
     /// here is what keeps the refusal *cheap*, which is the entire
     /// reason preflight exists.
-    pub fn open_grants(&self, handle: &str, now: &str) -> Result<i64> {
+    pub fn open_grants(&self, handle: &str, now: &str) -> Result<(i64, i64)> {
         self.connection
             .query_row(
-                "SELECT COUNT(*) FROM uploads
+                "SELECT COUNT(*), COALESCE(SUM(sealed_byte_size), 0) FROM uploads
                  WHERE holder_handle = ?1 AND expires_at > ?2",
                 rusqlite::params![handle, now],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(Into::into)
     }
@@ -476,6 +501,38 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<Vec<u8>>, _>>()?)
     }
 
+    /// The terms ids cited by this holder's receipts.
+    ///
+    /// Union'd into the export container's terms list. A receipt pins
+    /// the terms of a snapshot that is *erased*, so collecting terms
+    /// from live snapshots alone can ship a receipt citing a document
+    /// the container does not carry — the same pin-whose-preimage-is-
+    /// gone the container exists to prevent, arriving by the one route
+    /// nobody was watching.
+    pub fn receipt_terms_ids(&self, handle: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT terms_id FROM erasure_receipts WHERE holder_handle = ?1")?;
+        let rows = statement.query_map([handle], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
+    }
+
+    /// A receipt already issued for this scope under these terms.
+    ///
+    /// Erasure re-checks this under the lock before minting. The lock
+    /// is deliberately dropped for the blob work, so two erases of one
+    /// scope can both find live targets; without this each mints a
+    /// fresh receipt and a later retry returns both.
+    pub fn receipt_for(&self, handle: &str, scope: &str, terms_id: &str) -> Result<Option<Vec<u8>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT raw FROM erasure_receipts
+             WHERE holder_handle = ?1 AND scope = ?2 AND terms_id = ?3",
+        )?;
+        let mut rows =
+            statement.query_map(rusqlite::params![handle, scope, terms_id], |row| row.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// One receipt by id, scoped to its holder.
     pub fn receipt(&self, handle: &str, receipt_id: &str) -> Result<Option<Vec<u8>>> {
         let mut statement = self.connection.prepare(
@@ -498,7 +555,7 @@ impl Store {
     /// The outcome recorded for one holder's operation, if any.
     pub fn outcome(&self, handle: &str, operation_id: &str) -> Result<Option<(String, String, String)>> {
         let mut statement = self.connection.prepare(
-            "SELECT digest, status, recorded_at FROM operation_outcomes
+            "SELECT subject, status, recorded_at FROM operation_outcomes
              WHERE holder_handle = ?1 AND operation_id = ?2",
         )?;
         let mut rows = statement.query_map(rusqlite::params![handle, operation_id], |row| {

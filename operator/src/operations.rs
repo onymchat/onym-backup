@@ -38,17 +38,22 @@ pub async fn query(
     // unscoped lookup would let one holder read another's outcome by
     // guessing — and the ids are only as unguessable as the client
     // that minted them.
-    let (digest, status, recorded_at) = store
+    let (subject, status, recorded_at) = store
         .outcome(&holder.handle, &operation_id)
         .map_err(Error::from)?
         .ok_or(Error::NotFound(Resource::Operation))?;
 
+    // Named for what the operation was about. An upload's subject is a
+    // digest; an erasure's is its scope, which may be "all" — and a
+    // field called `digest` reporting "all" is a scope wearing a
+    // digest's name.
+    let subject_field = if status == "erased" { "scope" } else { "digest" };
     Ok(axum::Json(json!({
         "outcome": {
             "componentId": state.config.component_id,
             "operationId": operation_id,
             "status": status,
-            "digest": digest,
+            subject_field: subject,
             "recordedAt": recorded_at,
         }
     }))

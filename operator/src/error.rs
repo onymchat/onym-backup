@@ -76,6 +76,7 @@ pub enum Error {
         retained_bytes: i64,
         limit_bytes: i64,
         open_grants: i64,
+        open_grant_bytes: i64,
     },
 
     /// Commit arrived before every chunk did. The grant survives and
@@ -202,6 +203,7 @@ impl Error {
                 retained_bytes,
                 limit_bytes,
                 open_grants,
+                open_grant_bytes,
             } => json!({
                 "retainedSnapshots": retained_snapshots,
                 "maximumRetainedSnapshots": maximum_retained_snapshots,
@@ -213,6 +215,7 @@ impl Error {
                 // consumed the headroom. The refusal has to be legible
                 // from the refusal.
                 "openGrants": open_grants,
+                "openGrantBytes": open_grant_bytes,
             }),
             Error::UploadIncomplete {
                 missing_chunks,
