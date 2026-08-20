@@ -409,6 +409,17 @@ pub async fn commit(
         let already_held = store.snapshot_exists(&upload.holder_handle, &upload.digest)?;
         if !already_held {
             let (retained, retained_bytes) = store.usage(&upload.holder_handle)?;
+            // The holder's *other* open grants — this one is being
+            // committed, so it is no longer headroom anybody waits on,
+            // but the rest still are and are what a refused client
+            // needs named.
+            let now_stamp = now
+                .format(&Rfc3339)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            let (open_grants, open_grant_bytes) =
+                store.open_grants(&upload.holder_handle, &now_stamp)?;
+            let open_grants = (open_grants - 1).max(0);
+            let open_grant_bytes = (open_grant_bytes - upload.sealed_byte_size).max(0);
             if retained >= state.config.maximum_retained_snapshots {
                 state.blobs.discard_upload(&upload_id);
                 store.drop_upload(&upload_id)?;
@@ -418,10 +429,8 @@ pub async fn commit(
                     retained_bytes,
                     limit_bytes: state.config.maximum_sealed_snapshot_bytes
                         * state.config.maximum_retained_snapshots,
-                    // This grant is the one being committed, so it is
-                    // no longer headroom anybody is waiting on.
-                    open_grants: 0,
-                    open_grant_bytes: 0,
+                    open_grants,
+                    open_grant_bytes,
                 });
             }
         }

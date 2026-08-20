@@ -114,9 +114,6 @@ impl Store {
                 PRIMARY KEY (holder_handle, operation_id)
             );
 
-            -- Kept because §12 exports them and a holder may need to
-            -- re-present one. `excluded_scope` is the reason: what an
-            -- erasure did not reach outlives the snapshot it describes.
             -- Every terms document this operator has ever published.
             --
             -- §4.1 requires serving them forever, and a retained
@@ -134,6 +131,9 @@ impl Store {
                 first_seen  TEXT NOT NULL
             );
 
+            -- Kept because §12 exports them and a holder may need to
+            -- re-present one. `excludedScope` is the reason: what an
+            -- erasure did not reach outlives the snapshot it describes.
             CREATE TABLE IF NOT EXISTS erasure_receipts (
                 receipt_id    TEXT PRIMARY KEY,
                 holder_handle TEXT NOT NULL,
@@ -494,6 +494,72 @@ impl Store {
         Ok(())
     }
 
+    /// Mark erased, record the receipts, record the outcome — all or
+    /// nothing.
+    ///
+    /// One transaction because the three are one fact. Written
+    /// separately, a failure between them left bytes gone, rows still
+    /// saying `retained`, and no receipt — so `list` reported
+    /// `retained` about bytes that no longer existed, and a retry
+    /// answered `receipt_expired` about a receipt that was never
+    /// minted. Both are the operator asserting something false.
+    ///
+    /// The bytes are unlinked *after* this commits, which is the safe
+    /// direction: a crash in between leaves rows marked erased with
+    /// their bytes still on disk, and the sweep collects those as
+    /// orphans because it lists only live rows. The reverse — unlink
+    /// first — leaves a live row whose bytes are gone, which nothing
+    /// repairs and which `list` misreports forever.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_erasure(
+        &mut self,
+        handle: &str,
+        scope: &str,
+        digests: &[String],
+        receipts: &[(String, String, Vec<u8>, Vec<String>)],
+        operation_id: &str,
+        stamp: &str,
+    ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for digest in digests {
+            transaction.execute(
+                "UPDATE snapshots SET erased_at = ?3
+                 WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NULL",
+                rusqlite::params![handle, digest, stamp],
+            )?;
+        }
+        for (receipt_id, terms_id, raw, covers) in receipts {
+            transaction.execute(
+                "INSERT OR REPLACE INTO erasure_receipts
+                    (receipt_id, holder_handle, scope, terms_id, raw, issued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![receipt_id, handle, scope, terms_id, raw, stamp],
+            )?;
+            for digest in covers {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO receipt_snapshots (receipt_id, digest)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![receipt_id, digest],
+                )?;
+            }
+        }
+        let ids: Vec<&str> = receipts.iter().map(|(id, ..)| id.as_str()).collect();
+        transaction.execute(
+            "INSERT OR REPLACE INTO operation_outcomes
+                (operation_id, holder_handle, subject, status, receipt_ids, recorded_at)
+             VALUES (?1, ?2, ?3, 'erased', ?4, ?5)",
+            rusqlite::params![
+                operation_id,
+                handle,
+                scope,
+                serde_json::to_string(&ids).unwrap_or_default(),
+                stamp
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn record_receipt(
         &self,
         receipt_id: &str,
@@ -659,6 +725,17 @@ impl Store {
 
     /// Drop receipts past the declared window.
     pub fn sweep_receipts(&self, older_than: &str) -> Result<usize> {
+        // Coverage first, while the receipts it points at still exist
+        // to be selected. Left behind, these rows would outlive the
+        // `erasureReceipts` window they belong to — a digest a holder
+        // erased, kept past the bound the terms declare, which is the
+        // §15 problem rather than only a leak.
+        self.connection.execute(
+            "DELETE FROM receipt_snapshots WHERE receipt_id IN (
+                 SELECT receipt_id FROM erasure_receipts WHERE issued_at < ?1
+             )",
+            [older_than],
+        )?;
         Ok(self.connection.execute(
             "DELETE FROM erasure_receipts WHERE issued_at < ?1",
             [older_than],

@@ -61,9 +61,12 @@ pub async fn erase(
         .map_err(|e| Error::Internal(e.to_string()))?;
 
     let mut receipts = Vec::new();
-    let mut issued: Vec<String> = Vec::new();
+    // Filled inside the locked section, used after it: the bytes are
+    // unlinked once the bookkeeping has committed.
+    let mut doomed_hex: Vec<String> = Vec::new();
+    let mut who = String::new();
     {
-        let store = state.store.lock().await;
+        let mut store = state.store.lock().await;
         let holder = authenticate(
             &headers,
             "POST",
@@ -136,40 +139,12 @@ pub async fn erase(
             // nothing.
             return Err(Error::NotFound(Resource::Snapshot));
         }
-        // The lock is held from target selection through to the
-        // receipts. Two erases of one scope would otherwise both find
-        // live targets and each mint a receipt, making the receipt
-        // count a record of concurrency rather than of erasures.
-        //
-        // Holding the lock is not the same as doing the work here,
-        // though: `remove_dir_all` over every chunk of every snapshot
-        // is blocking I/O, and on a runtime thread it stalls the
-        // executor as well as the lock. It goes to the blocking pool
-        // like every other blob operation — the guard is held across
-        // the await, which is what serialises erasures, and nothing is
-        // unlinked on the runtime thread.
-        //
-        // Bytes first, then the rows. A crash between them leaves a
-        // record whose bytes are gone, which the sweep resolves and
-        // which `list` reports as erased — the safe direction. The
-        // reverse would leave bytes the holder believes are gone.
-        let doomed: Vec<String> = targets
-            .iter()
-            .map(|row| crate::uploads::digest_hex(&row.digest))
-            .collect::<Result<Vec<_>>>()?;
-        let handle = holder.handle.clone();
-        crate::uploads::blocking(&state, move |state| {
-            for digest_hex in &doomed {
-                state.blobs.erase(&handle, digest_hex)?;
-            }
-            Ok(())
-        })
-        .await?;
-
-        for row in &targets {
-            store.mark_erased(&holder.handle, &row.digest, &stamp)?;
-        }
-
+        // Everything that can fail runs before anything is destroyed.
+        // Composing a receipt reads the pinned terms and can refuse —
+        // terms with no completion deadline, for one — and doing that
+        // after the bytes were gone left the holder erased, with no
+        // receipt, and a retry answering `receipt_expired` about a
+        // receipt that never existed.
         let mut pinned: Vec<String> = targets
             .iter()
             .map(|row| row.accepted_terms_id.clone())
@@ -177,15 +152,8 @@ pub async fn erase(
         pinned.sort();
         pinned.dedup();
 
+        let mut minted: Vec<(String, String, Vec<u8>, Vec<String>)> = Vec::new();
         for terms_id in pinned {
-            // A fresh receipt every time something was actually erased.
-            // `scope: "all"` is evaluated at request time, so erasing
-            // "all" again after new snapshots were retained is a new
-            // erasure of new bytes — handing back the earlier receipt
-            // would misdate the commitment, since `acknowledgedAt` and
-            // `completionCommittedBy` are about the erasure that
-            // produced it. Replay belongs to the empty-scope path
-            // above, and only there.
             let (raw, _) = store
                 .terms_document(&terms_id)?
                 .ok_or(Error::NotFound(Resource::Terms))?;
@@ -209,28 +177,47 @@ pub async fn erase(
                 .ok_or_else(|| Error::Internal("receipt has no id".into()))?
                 .to_string();
             let (document, signed) = crate::documents::sign_receipt(receipt, &state.signing)?;
-            store.record_receipt(
-                &receipt_id,
-                &holder.handle,
-                &request.scope,
-                &terms_id,
-                &signed,
-                &covered,
-                &stamp,
-            )?;
-            issued.push(receipt_id);
+            minted.push((receipt_id, terms_id, signed, covered));
             receipts.push(document);
         }
 
-        store.record_outcome(
-            &request.operation_id,
+        // Rows, receipts and outcome in one transaction: they are one
+        // fact, and a failure between them is the operator asserting
+        // something false.
+        let doomed: Vec<String> = targets.iter().map(|row| row.digest.clone()).collect();
+        store.commit_erasure(
             &holder.handle,
             &request.scope,
-            "erased",
-            Some(serde_json::to_string(&issued).unwrap_or_default()),
+            &doomed,
+            &minted,
+            &request.operation_id,
             &stamp,
         )?;
+
+        who = holder.handle.clone();
+        doomed_hex = targets
+            .iter()
+            .map(|row| crate::uploads::digest_hex(&row.digest))
+            .collect::<Result<Vec<_>>>()?;
     }
+
+    // Bytes last, and deliberately. A crash here leaves rows marked
+    // erased with their bytes still on disk, which the sweep collects
+    // as orphans because it lists only live rows — the safe direction,
+    // converging on what the holder was told. Unlinking first would
+    // leave a live row whose bytes are gone: nothing repairs that, and
+    // `list` would report `retained` about them forever.
+    //
+    // Off the runtime thread. `remove_dir_all` over every chunk of
+    // every snapshot is blocking I/O, and doing it on a runtime thread
+    // stalls the executor.
+    crate::uploads::blocking(&state, move |state| {
+        for digest_hex in &doomed_hex {
+            state.blobs.erase(&who, digest_hex)?;
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(axum::Json(receipts).into_response())
 }
@@ -319,6 +306,7 @@ fn iso8601_days(period: &str) -> Result<time::Duration> {
 #[cfg(test)]
 mod tests {
     use crate::uploads::tests::Harness;
+
     use axum::http::StatusCode;
     use ed25519_dalek::{Verifier, VerifyingKey};
     use serde_json::{json, Value};
@@ -670,7 +658,7 @@ mod tests {
                 .connection_for_tests()
                 .execute(
                     "UPDATE terms_documents SET raw = ?2 WHERE terms_id = ?1",
-                    rusqlite::params![harness.terms_id(), serde_json::to_vec(&terms).unwrap()],
+                    ::rusqlite::params![harness.terms_id(), serde_json::to_vec(&terms).unwrap()],
                 )
                 .unwrap();
         }
@@ -1169,5 +1157,89 @@ mod tests {
         // Replay returns both, since they share an acknowledgedAt.
         let (_, replay) = erase(&harness, "all").await;
         assert_eq!(replay.as_array().unwrap().len(), 2, "replay dropped half the erasure");
+    }
+
+    /// A failure while minting must leave nothing half-done.
+    ///
+    /// Composing a receipt reads the pinned terms and can refuse. When
+    /// that happened *after* the bytes were unlinked, the holder was
+    /// erased with no receipt, `list` still said `retained`, and a
+    /// retry answered `receipt_expired` about a receipt that never
+    /// existed — three false statements from one failed request.
+    #[tokio::test]
+    async fn a_refused_receipt_erases_nothing() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&snapshot)));
+
+        // Terms that cannot produce a receipt: no completion deadline.
+        {
+            let store = harness.state.store.lock().await;
+            let (raw, _) = store.terms_document(&harness.terms_id()).unwrap().unwrap();
+            let mut terms: Value = serde_json::from_slice(&raw).unwrap();
+            terms["erasure"].as_object_mut().unwrap().remove("completionDeadline");
+            store
+                .connection_for_tests()
+                .execute(
+                    "UPDATE terms_documents SET raw = ?2 WHERE terms_id = ?1",
+                    ::rusqlite::params![harness.terms_id(), serde_json::to_vec(&terms).unwrap()],
+                )
+                .unwrap();
+        }
+
+        let (status, _) = erase(&harness, &digest).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Nothing was destroyed and nothing was claimed.
+        let (_, listed) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        assert_eq!(listed.as_array().unwrap()[0]["status"], "retained");
+        let hex_digest = hex::encode(Sha256::digest(&snapshot));
+        let (status, bytes) = harness
+            .send("GET", &format!("/v1/snapshots/{hex_digest}"), vec![])
+            .await;
+        assert_eq!(status, StatusCode::OK, "the bytes were erased for a refused receipt");
+        assert_eq!(bytes, snapshot);
+    }
+
+    /// The sweep takes a receipt's coverage with it.
+    ///
+    /// Coverage rows name digests a holder erased. Left behind they
+    /// outlive the `erasureReceipts` window the terms declare, which is
+    /// a §15 retention problem rather than only a leak.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweeping_a_receipt_takes_its_coverage() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        erase(&harness, "all").await;
+
+        let count = |harness: &Harness| {
+            let store = harness.state.store.blocking_lock();
+            store
+                .connection_for_tests()
+                .query_row("SELECT COUNT(*) FROM receipt_snapshots", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert!(tokio::task::block_in_place(|| count(&harness)) > 0);
+
+        tokio::task::block_in_place(|| {
+            crate::sweep::reconcile(
+                &harness.state.store,
+                &harness.state.blobs,
+                "2099-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2099-01-01T00:00:00Z",
+            )
+        });
+        assert_eq!(
+            tokio::task::block_in_place(|| count(&harness)),
+            0,
+            "coverage rows outlived the receipts they belong to"
+        );
     }
 }
