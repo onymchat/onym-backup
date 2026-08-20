@@ -32,7 +32,7 @@
 //! |---|---|
 //! | `snapshots/<hex>.seal` | `GET /v1/exports/<hex>` |
 //! | `receipts/<id>.json` | `GET /v1/exports/receipts/<id>` |
-//! | `terms/<hex>.json` | the snapshot entry's `termsUrl` |
+//! | `terms/<hex>.json` | the terms entry's `termsUrl` |
 //! | `terms/<hex>.json.sig` | `termsUrl` + `.sig` |
 //!
 //! That the terms come from `/terms/` rather than from under
@@ -43,14 +43,15 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::api::AppState;
 use crate::auth::authenticate;
+use crate::blobs::{digest_hex, snapshot_stream};
 use crate::error::{Error, Resource, Result};
 
 /// `GET /v1/exports` — the container manifest.
@@ -99,6 +100,7 @@ pub async fn manifest(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
             .collect::<Vec<_>>(),
         "terms": terms_ids.iter().map(|id| json!({
             "termsId": id,
+            "termsUrl": terms_url(&state, id),
             "file": format!("terms/{}.json", hex_of(id)),
             "signature": format!("terms/{}.json.sig", hex_of(id)),
         })).collect::<Vec<_>>(),
@@ -119,21 +121,49 @@ pub async fn snapshot(
     let path = format!("/v1/exports/{digest_path}");
     let digest = format!("sha256:{digest_path}");
 
-    let holder = {
+    let (holder, row) = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
-        crate::uploads::digest_hex(&digest)?;
-        if !store.snapshot_exists(&holder.handle, &digest)? {
+        digest_hex(&digest)?;
+        let row = store
+            .snapshot_record(&holder.handle, &digest)?
+            .ok_or(Error::NotFound(Resource::Snapshot))?;
+        if row.erased_at.is_some() {
             return Err(Error::NotFound(Resource::Snapshot));
         }
-        holder
+        if row.retained_until.is_some() {
+            return Err(Error::RetentionExpired);
+        }
+        (holder, row)
     };
 
-    let paths = state.blobs.chunk_paths(&holder.handle, &digest_path)?;
+    let paths = match state.blobs.chunk_paths(
+        &holder.handle,
+        &digest_path,
+        row.chunk_count,
+        row.sealed_byte_size,
+    ) {
+        Ok(paths) => paths,
+        Err(Error::RetentionExpired) => {
+            let unavailable_at = now
+                .format(&Rfc3339)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            state
+                .store
+                .lock()
+                .await
+                .mark_unavailable(&holder.handle, &digest, &unavailable_at)?;
+            return Err(Error::RetentionExpired);
+        }
+        Err(error) => return Err(error),
+    };
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        axum::body::Body::from_stream(crate::uploads::snapshot_stream(paths)),
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, row.sealed_byte_size.to_string()),
+        ],
+        axum::body::Body::from_stream(snapshot_stream(paths)),
     )
         .into_response())
 }
@@ -185,7 +215,7 @@ fn hex_of(digest: &str) -> &str {
 mod tests {
     use crate::uploads::tests::Harness;
     use axum::http::StatusCode;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
     /// The container carries the terms **bytes**, not just a digest —
@@ -208,8 +238,13 @@ mod tests {
 
         // The document and its detached signature are both fetchable,
         // which is what makes the pin checkable rather than decorative.
-        let hex = harness.terms_id().strip_prefix("sha256:").unwrap().to_string();
-        for path in [format!("/terms/{hex}.json"), format!("/terms/{hex}.json.sig")] {
+        let terms_url = terms[0]["termsUrl"]
+            .as_str()
+            .expect("the manifest did not provide a terms URL");
+        let path = terms_url
+            .strip_prefix(harness.state.config.public_url.as_str())
+            .expect("termsUrl is outside the operator origin");
+        for path in [path.to_string(), format!("{path}.sig")] {
             let response = crate::api::router(harness.state.clone())
                 .oneshot(
                     axum::http::Request::builder()
@@ -221,6 +256,34 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_receipt_only_export_still_locates_its_terms() {
+        let harness = Harness::new(vec![]);
+        harness
+            .store_snapshot(&(0..20u8).collect::<Vec<u8>>())
+            .await;
+        let erase = serde_json::to_vec(&json!({
+            "version": 1,
+            "operationId": hex::encode(uuid::Uuid::new_v4().as_bytes()),
+            "scope": "all"
+        }))
+        .unwrap();
+        let (status, _) = harness.send("POST", "/v1/erasures", erase).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, body) = harness.send("GET", "/v1/exports", vec![]).await;
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert!(manifest["snapshots"].as_array().unwrap().is_empty());
+        assert!(!manifest["receipts"].as_array().unwrap().is_empty());
+        assert!(
+            manifest["terms"][0]["termsUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://"),
+            "receipt-only terms have no fetch location"
+        );
     }
 
     /// The `.seal` bytes are what was uploaded, byte for byte. This is

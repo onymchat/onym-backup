@@ -147,18 +147,21 @@ impl Config {
             maximum_retained_snapshots: parse_positive_i64("BACKUP_MAX_SNAPSHOTS", 3)?,
             chunk_bytes: chunk_bytes()?,
             upload_expiry_secs: parse_positive_i64("BACKUP_UPLOAD_EXPIRY_SECS", 24 * 3600)?,
-            max_skew_secs: parse_positive_i64("BACKUP_MAX_SKEW_SECS", 300)?,
-            receipt_retention_secs: parse_positive_i64(
+            max_skew_secs: parse_past_window_secs("BACKUP_MAX_SKEW_SECS", 300, 2)?,
+            receipt_retention_secs: parse_past_window_secs(
                 "BACKUP_RECEIPT_RETENTION_SECS",
                 365 * 24 * 3600,
+                1,
             )?,
-            erased_reference_retention_secs: parse_positive_i64(
+            erased_reference_retention_secs: parse_past_window_secs(
                 "BACKUP_ERASED_REFERENCE_RETENTION_SECS",
                 365 * 24 * 3600,
+                1,
             )?,
-            outcome_retention_secs: parse_positive_i64(
+            outcome_retention_secs: parse_past_window_secs(
                 "BACKUP_OUTCOME_RETENTION_SECS",
                 6 * 3600,
+                1,
             )?,
         })
     }
@@ -221,6 +224,8 @@ Optional:
   BACKUP_UPLOAD_EXPIRY_SECS     default 86400
   BACKUP_MAX_SKEW_SECS          default 300
   BACKUP_OUTCOME_RETENTION_SECS default 21600
+  BACKUP_RECEIPT_RETENTION_SECS default 31536000
+  BACKUP_ERASED_REFERENCE_RETENTION_SECS default 31536000
 "
     }
 }
@@ -264,6 +269,28 @@ fn parse_positive_i64(key: &str, default: i64) -> Result<i64, String> {
     };
     if value <= 0 {
         return Err(format!("{key} must be greater than zero"));
+    }
+    Ok(value)
+}
+
+/// A duration subtracted from the wall clock by the sweep.
+///
+/// Positivity alone is not enough: `OffsetDateTime - Duration`
+/// panics outside its representable range. Refuse that configuration
+/// at boot rather than letting the hourly task die and silently stop
+/// enforcing every retention window.
+fn parse_past_window_secs(key: &str, default: i64, multiplier: i64) -> Result<i64, String> {
+    let value = parse_positive_i64(key, default)?;
+    let seconds = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{key} is too large"))?;
+    if time::OffsetDateTime::now_utc()
+        .checked_sub(time::Duration::seconds(seconds))
+        .is_none()
+    {
+        return Err(format!(
+            "{key} is too large for the supported timestamp range"
+        ));
     }
     Ok(value)
 }
@@ -344,5 +371,28 @@ mod tests {
 
         assert!(refused.is_err(), "an unfulfillable chunk size was accepted");
         assert_eq!(accepted.unwrap(), ceiling as i64);
+    }
+
+    #[test]
+    fn an_unrepresentable_retention_window_is_refused_at_boot() {
+        let key = "BACKUP_TEST_RETENTION_WINDOW_SECS";
+        std::env::set_var(key, "400000000000");
+        let result = parse_past_window_secs(key, 1, 1);
+        std::env::remove_var(key);
+
+        assert!(result.is_err(), "a sweep-killing duration was accepted");
+        assert!(result.unwrap_err().contains("timestamp range"));
+    }
+
+    #[test]
+    fn usage_names_every_retention_window() {
+        let usage = Config::usage();
+        for key in [
+            "BACKUP_OUTCOME_RETENTION_SECS",
+            "BACKUP_RECEIPT_RETENTION_SECS",
+            "BACKUP_ERASED_REFERENCE_RETENTION_SECS",
+        ] {
+            assert!(usage.contains(key), "{key} is absent from --help");
+        }
     }
 }

@@ -33,10 +33,19 @@ pub struct Swept {
     pub expired_grants: usize,
     pub orphan_incoming: usize,
     pub orphan_snapshots: usize,
+    pub unavailable_snapshots: usize,
     pub spent_nonces: usize,
     pub aged_outcomes: usize,
     pub aged_receipts: usize,
     pub forgotten_references: usize,
+}
+
+pub struct Cutoffs<'a> {
+    pub now: &'a str,
+    pub nonce: &'a str,
+    pub outcome: &'a str,
+    pub receipt: &'a str,
+    pub erased_reference: &'a str,
 }
 
 /// Runs at boot and then on a timer, on the blocking pool. Failures are
@@ -48,17 +57,22 @@ pub struct Swept {
 /// store from one.
 pub fn reconcile(
     store: &Mutex<Store>,
+    blob_mutations: &Mutex<()>,
     blobs: &Blobs,
-    now: &str,
-    nonce_floor: &str,
-    outcome_floor: &str,
-    receipt_floor: &str,
-    erased_floor: &str,
+    cutoffs: Cutoffs<'_>,
 ) -> Swept {
+    let Cutoffs {
+        now,
+        nonce: nonce_floor,
+        outcome: outcome_floor,
+        receipt: receipt_floor,
+        erased_reference: erased_floor,
+    } = cutoffs;
     let mut swept = Swept {
         expired_grants: 0,
         orphan_incoming: 0,
         orphan_snapshots: 0,
+        unavailable_snapshots: 0,
         spent_nonces: 0,
         aged_outcomes: 0,
         aged_receipts: 0,
@@ -76,7 +90,10 @@ pub fn reconcile(
         }
     };
     for id in expired {
-        blobs.discard_upload(&id);
+        if let Err(error) = blobs.discard_upload(&id) {
+            tracing::warn!(%error, "could not discard expired upload bytes");
+            continue;
+        }
         if let Err(error) = store.blocking_lock().drop_upload(&id) {
             tracing::warn!(%error, "could not drop expired upload row");
             continue;
@@ -95,12 +112,60 @@ pub fn reconcile(
             }
         };
         if !known {
-            blobs.discard_upload(&id);
-            swept.orphan_incoming += 1;
+            match blobs.discard_upload(&id) {
+                Ok(()) => swept.orphan_incoming += 1,
+                Err(error) => tracing::warn!(%error, "could not discard orphan upload"),
+            }
         }
     }
 
-    // (3) Snapshot directories with no row — the crash-between-rename-
+    // (3) Rows whose committed bytes are absent or incomplete. The
+    // profile is explicit: such a row is marked unavailable and is
+    // never reported as retained.
+    let claimed = match store.blocking_lock().all_live_snapshots() {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not list live snapshots");
+            Vec::new()
+        }
+    };
+    for (handle, row) in claimed {
+        let _mutation = blob_mutations.blocking_lock();
+        let still_live = match store.blocking_lock().snapshot_exists(&handle, &row.digest) {
+            Ok(live) => live,
+            Err(error) => {
+                tracing::warn!(%error, "could not re-check live snapshot");
+                continue;
+            }
+        };
+        if !still_live {
+            continue;
+        }
+        let digest = match crate::blobs::digest_hex(&row.digest) {
+            Ok(digest) => digest,
+            Err(error) => {
+                tracing::warn!(%error, "stored snapshot has an invalid digest");
+                continue;
+            }
+        };
+        match blobs.chunk_paths(&handle, &digest, row.chunk_count, row.sealed_byte_size) {
+            Ok(_) => {}
+            Err(crate::error::Error::RetentionExpired) => {
+                match store
+                    .blocking_lock()
+                    .mark_unavailable(&handle, &row.digest, now)
+                {
+                    Ok(changed) => swept.unavailable_snapshots += changed,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not mark snapshot unavailable")
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not inspect retained snapshot"),
+        }
+    }
+
+    // (4) Snapshot directories with no row — the crash-between-rename-
     // and-insert case. Deleted, never adopted.
     //
     // The live set is read once, unlocked work happens against it, and
@@ -118,6 +183,11 @@ pub fn reconcile(
         if live.contains(&(handle.clone(), digest.clone())) {
             continue;
         }
+        // Commit and erase take this before the store lock too. Keep
+        // the fresh row check and the unlink in the same mutation
+        // critical section so a re-upload cannot revive the row
+        // between them and then lose its newly committed bytes.
+        let _mutation = blob_mutations.blocking_lock();
         let still_absent = match store
             .blocking_lock()
             .snapshot_exists(&handle, &format!("sha256:{digest}"))
@@ -138,7 +208,7 @@ pub fn reconcile(
         swept.orphan_snapshots += 1;
     }
 
-    // (4) Spent nonces. The table is the replay defence, and it is the
+    // (5) Spent nonces. The table is the replay defence, and it is the
     // one piece of per-holder state that grows with traffic rather than
     // with what is stored — leaving it unbounded would make the replay
     // window's own bookkeeping the largest thing the operator keeps
@@ -148,7 +218,7 @@ pub fn reconcile(
         Err(error) => tracing::warn!(%error, "could not sweep nonces"),
     }
 
-    // (5–6) Outcomes, receipts, and receipt coverage. Upload outcomes
+    // (6–7) Outcomes, receipts, and receipt coverage. Upload outcomes
     // use the short declared window; erase outcomes use the receipt
     // window. The latter and the receipts they name cross their bound
     // atomically, as do receipt rows and their coverage.
@@ -163,7 +233,7 @@ pub fn reconcile(
         Err(error) => tracing::warn!(%error, "could not sweep outcomes and receipts"),
     }
 
-    // (7) Erased references past their window. Every promise that
+    // (8) Erased references past their window. Every promise that
     // rides on the row ends here too: `list` stops reporting `erased`
     // and `/v1/erasures` stops answering `receipt_expired`, because the
     // operator has genuinely forgotten rather than chosen to be coy.
@@ -197,6 +267,22 @@ mod tests {
 
     const HANDLE: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
+    fn cutoffs<'a>(
+        now: &'a str,
+        nonce: &'a str,
+        outcome: &'a str,
+        receipt: &'a str,
+        erased_reference: &'a str,
+    ) -> Cutoffs<'a> {
+        Cutoffs {
+            now,
+            nonce,
+            outcome,
+            receipt,
+            erased_reference,
+        }
+    }
+
     #[test]
     fn an_expired_grant_gives_its_disk_back() {
         let store = Mutex::new(Store::in_memory().unwrap());
@@ -212,7 +298,18 @@ mod tests {
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
         assert_eq!(swept.expired_grants, 1);
         assert!(store.blocking_lock().upload("u1").unwrap().is_none());
         assert!(blobs.incoming_on_disk().is_empty());
@@ -232,7 +329,18 @@ mod tests {
             .unwrap();
         blobs.begin_upload("u1").unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-02T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
         assert_eq!(swept.expired_grants, 0);
         assert_eq!(swept.orphan_incoming, 0);
         assert!(store.blocking_lock().upload("u1").unwrap().is_some());
@@ -246,14 +354,31 @@ mod tests {
         let blobs = Blobs::new(dir.path());
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
-        blobs.commit("u1", HANDLE, "aa").unwrap();
+        blobs.commit("u1", HANDLE, "aa", 1, 3).unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
         assert_eq!(swept.orphan_snapshots, 1);
         assert!(blobs.read_snapshot(HANDLE, "aa").is_err());
         // And nothing was invented: the operator does not now claim to
         // hold a snapshot whose digest it never checked.
-        assert!(store.blocking_lock().all_retained_keys().unwrap().is_empty());
+        assert!(
+            store
+                .blocking_lock()
+                .all_retained_keys()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -263,15 +388,64 @@ mod tests {
         let blobs = Blobs::new(dir.path());
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
-        blobs.commit("u1", HANDLE, "aa").unwrap();
+        blobs.commit("u1", HANDLE, "aa", 1, 3).unwrap();
         store
             .blocking_lock()
             .retain(&upload_row("u1", HANDLE, "sha256:aa"), "2026-01-01T00:00:00Z")
             .unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
         assert_eq!(swept.orphan_snapshots, 0);
         assert_eq!(blobs.read_snapshot(HANDLE, "aa").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_row_without_complete_bytes_is_marked_unavailable() {
+        let store = Mutex::new(Store::in_memory().unwrap());
+        let dir = tempfile::TempDir::new().unwrap();
+        let blobs = Blobs::new(dir.path());
+        let digest = format!("sha256:{}", "aa".repeat(32));
+        store
+            .blocking_lock()
+            .retain(&upload_row("u1", HANDLE, &digest), "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-02T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
+        assert_eq!(swept.unavailable_snapshots, 1);
+        assert!(
+            !store
+                .blocking_lock()
+                .snapshot_exists(HANDLE, &digest)
+                .unwrap()
+        );
+        let row = store
+            .blocking_lock()
+            .snapshot_record(HANDLE, &digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.retained_until.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 
     /// The replay table is the one piece of per-holder state that grows
@@ -292,7 +466,18 @@ mod tests {
             .record_nonce(HANDLE, "fresh", "2026-01-01T12:00:00Z")
             .unwrap();
 
-        let swept = reconcile(&store, &blobs, "2026-01-01T12:00:00Z", "2026-01-01T06:00:00Z", "2026-01-01T12:00:00Z", "2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+        let swept = reconcile(
+            &store,
+            &Mutex::new(()),
+            &blobs,
+            cutoffs(
+                "2026-01-01T12:00:00Z",
+                "2026-01-01T06:00:00Z",
+                "2026-01-01T12:00:00Z",
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+            ),
+        );
         assert_eq!(swept.spent_nonces, 1);
 
         // The one still inside the window is still refused, which is

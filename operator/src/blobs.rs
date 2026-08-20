@@ -15,8 +15,10 @@
 //! people is 80 MB on disk, forever. That is a real unit cost and it
 //! belongs in the pricing rather than being engineered away later.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -47,8 +49,15 @@ impl Blobs {
     }
 
     pub fn begin_upload(&self, upload_id: &str) -> Result<()> {
-        std::fs::create_dir_all(self.incoming_dir(upload_id))
-            .map_err(|e| Error::Internal(format!("create incoming dir: {e}")))
+        let incoming = self.incoming_dir(upload_id);
+        std::fs::create_dir_all(&incoming)
+            .map_err(|e| Error::Internal(format!("create incoming dir: {e}")))?;
+        sync_dir(&incoming)?;
+        if let Some(parent) = incoming.parent() {
+            sync_dir(parent)?;
+        }
+        sync_dir(&self.root)?;
+        Ok(())
     }
 
     /// Write one chunk of an in-flight upload.
@@ -59,13 +68,31 @@ impl Blobs {
     /// what was already accepted.
     pub fn write_chunk(&self, upload_id: &str, index: i64, bytes: &[u8]) -> Result<()> {
         let path = self.incoming_dir(upload_id).join(format!("{index}.part"));
-        if let Ok(existing) = std::fs::read(&path) {
-            if existing == bytes {
-                return Ok(());
+        match std::fs::read(&path) {
+            Ok(existing) => {
+                if existing == bytes {
+                    return Ok(());
+                }
+                return Err(Error::ChunkMismatch);
             }
-            return Err(Error::ChunkMismatch);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Internal(format!("read existing chunk: {error}")));
+            }
         }
-        std::fs::write(&path, bytes).map_err(|e| Error::Internal(format!("write chunk: {e}")))
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| Error::Internal(format!("create chunk: {e}")))?;
+        file.write_all(bytes)
+            .map_err(|e| Error::Internal(format!("write chunk: {e}")))?;
+        file.sync_all()
+            .map_err(|e| Error::Internal(format!("sync chunk: {e}")))?;
+        sync_dir(
+            path.parent()
+                .ok_or_else(|| Error::Internal("chunk has no parent directory".into()))?,
+        )
     }
 
     /// What has arrived: total bytes, and the gaps as inclusive
@@ -119,25 +146,68 @@ impl Blobs {
     /// orphan directory, which the startup sweep reconciles — and it
     /// reconciles by deleting bytes with no row, never by inventing a
     /// row for bytes it found.
-    pub fn commit(&self, upload_id: &str, handle: &str, digest_hex: &str) -> Result<()> {
+    pub fn commit(
+        &self,
+        upload_id: &str,
+        handle: &str,
+        digest_hex: &str,
+        chunk_count: i64,
+        sealed_byte_size: i64,
+    ) -> Result<()> {
         let destination = self.snapshot_dir(handle, digest_hex);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Internal(format!("create holder dir: {e}")))?;
         }
         if destination.exists() {
-            // Already held for this holder. Drop the duplicate upload
-            // rather than replacing bytes that are already addressed by
-            // their own digest.
-            let _ = std::fs::remove_dir_all(self.incoming_dir(upload_id));
+            // Never adopt a directory merely because its name matches
+            // the digest. It may be a short remnant of a failed erase
+            // or power loss. Only verified bytes can displace the
+            // freshly verified upload.
+            let paths = match self.chunk_paths(handle, digest_hex, chunk_count, sealed_byte_size) {
+                Ok(paths) => paths,
+                Err(Error::RetentionExpired) => {
+                    return Err(Error::Internal(
+                        "existing snapshot destination is incomplete".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            let actual = digest_paths(&paths)?;
+            if actual != format!("sha256:{digest_hex}") {
+                return Err(Error::Internal(
+                    "existing snapshot bytes do not match their digest".into(),
+                ));
+            }
+            self.discard_upload(upload_id)?;
             return Ok(());
         }
-        std::fs::rename(self.incoming_dir(upload_id), &destination)
-            .map_err(|e| Error::Internal(format!("commit upload: {e}")))
+        let incoming = self.incoming_dir(upload_id);
+        sync_dir(&incoming)?;
+        std::fs::rename(&incoming, &destination)
+            .map_err(|e| Error::Internal(format!("commit upload: {e}")))?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Internal("snapshot has no parent directory".into()))?;
+        sync_dir(parent)?;
+        if let Some(shard) = parent.parent() {
+            sync_dir(shard)?;
+        }
+        sync_dir(&self.root)
     }
 
-    pub fn discard_upload(&self, upload_id: &str) {
-        let _ = std::fs::remove_dir_all(self.incoming_dir(upload_id));
+    pub fn discard_upload(&self, upload_id: &str) -> Result<()> {
+        let incoming = self.incoming_dir(upload_id);
+        match std::fs::remove_dir_all(&incoming) {
+            Ok(()) => {
+                if let Some(parent) = incoming.parent() {
+                    sync_dir(parent)?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Internal(format!("discard upload: {error}"))),
+        }
     }
 
     /// The chunk files of a retained snapshot, in index order.
@@ -147,19 +217,84 @@ impl Blobs {
     /// same exposure, so handing back a `Vec<u8>` would have put the
     /// whole snapshot in memory per concurrent reader and made a few
     /// downloads enough to exhaust it.
-    pub fn chunk_paths(&self, handle: &str, digest_hex: &str) -> Result<Vec<PathBuf>> {
-        let dir = self.snapshot_dir(handle, digest_hex);
-        let mut indices: Vec<i64> = std::fs::read_dir(&dir)
-            .map_err(|_| Error::RetentionExpired)?
-            .filter_map(std::result::Result::ok)
-            .filter_map(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_suffix(".part"))
+    pub fn chunk_paths(
+        &self,
+        handle: &str,
+        digest_hex: &str,
+        chunk_count: i64,
+        sealed_byte_size: i64,
+    ) -> Result<Vec<PathBuf>> {
+        let paths = self.chunk_paths_unchecked(handle, digest_hex)?;
+        let actual: Vec<i64> = paths
+            .iter()
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
                     .and_then(|name| name.parse().ok())
             })
             .collect();
+        let contiguous = actual
+            .iter()
+            .enumerate()
+            .all(|(expected, actual)| *actual == expected as i64);
+        if actual.len() as i64 != chunk_count || !contiguous {
+            tracing::error!(
+                ?actual,
+                expected_chunk_count = chunk_count,
+                "retained snapshot has a chunk gap"
+            );
+            return Err(Error::RetentionExpired);
+        }
+        let mut total = 0i64;
+        for path in &paths {
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Error::RetentionExpired
+                } else {
+                    Error::Internal(format!("stat snapshot chunk: {error}"))
+                }
+            })?;
+            if !metadata.is_file() {
+                tracing::error!(path = %path.display(), "snapshot chunk is not a file");
+                return Err(Error::RetentionExpired);
+            }
+            total = total
+                .checked_add(metadata.len() as i64)
+                .ok_or_else(|| Error::Internal("snapshot size overflow".into()))?;
+        }
+        if total != sealed_byte_size {
+            tracing::error!(
+                actual_bytes = total,
+                expected_bytes = sealed_byte_size,
+                "retained snapshot has the wrong byte size"
+            );
+            return Err(Error::RetentionExpired);
+        }
+        Ok(paths)
+    }
+
+    fn chunk_paths_unchecked(&self, handle: &str, digest_hex: &str) -> Result<Vec<PathBuf>> {
+        let dir = self.snapshot_dir(handle, digest_hex);
+        let entries = std::fs::read_dir(&dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::RetentionExpired
+            } else {
+                Error::Internal(format!("read snapshot directory: {error}"))
+            }
+        })?;
+        let mut indices: Vec<i64> = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| Error::Internal(format!("read snapshot entry: {error}")))?;
+            if let Some(index) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".part"))
+                .and_then(|name| name.parse().ok())
+            {
+                indices.push(index);
+            }
+        }
         indices.sort_unstable();
         Ok(indices
             .into_iter()
@@ -172,7 +307,7 @@ impl Blobs {
     #[cfg(test)]
     pub fn read_snapshot(&self, handle: &str, digest_hex: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        for path in self.chunk_paths(handle, digest_hex)? {
+        for path in self.chunk_paths_unchecked(handle, digest_hex)? {
             out.extend_from_slice(
                 &std::fs::read(&path)
                     .map_err(|e| Error::Internal(format!("read snapshot chunk: {e}")))?,
@@ -213,16 +348,83 @@ impl Blobs {
     /// "Already gone" is the outcome the caller wanted, so it is not an
     /// error; anything else is.
     pub fn erase(&self, handle: &str, digest_hex: &str) -> Result<()> {
-        match std::fs::remove_dir_all(self.snapshot_dir(handle, digest_hex)) {
-            Ok(()) => Ok(()),
+        let snapshot = self.snapshot_dir(handle, digest_hex);
+        match std::fs::remove_dir_all(&snapshot) {
+            Ok(()) => sync_dir(
+                snapshot
+                    .parent()
+                    .ok_or_else(|| Error::Internal("snapshot has no parent directory".into()))?,
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Internal(format!("erase snapshot: {error}"))),
         }
     }
 
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+fn digest_paths(paths: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    for path in paths {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| Error::Internal(format!("open snapshot chunk: {e}")))?;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|e| Error::Internal(format!("read snapshot chunk: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| Error::Internal(format!("sync directory {}: {e}", path.display())))
+}
+
+/// The snapshot's bytes, chunk by chunk, a bounded buffer at a time.
+pub fn snapshot_stream(
+    paths: Vec<PathBuf>,
+) -> impl futures_core::Stream<Item = std::io::Result<Bytes>> {
+    async_stream::try_stream! {
+        for path in paths {
+            let mut file = tokio::fs::File::open(&path).await?;
+            let mut buffer = vec![0u8; 256 * 1024];
+            loop {
+                let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                yield Bytes::copy_from_slice(&buffer[..read]);
+            }
+        }
+    }
+}
+
+/// `sha256:<64 lowercase hex>` → the hex, or a refusal.
+pub fn digest_hex(digest: &str) -> Result<String> {
+    let hex_value = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| Error::BadRequest("digest must be sha256:<hex>".into()))?;
+    if hex_value.len() != 64
+        || !hex_value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Error::BadRequest(
+            "digest must be 64 lowercase hex characters".into(),
+        ));
+    }
+    Ok(hex_value.to_string())
 }
 
 /// Directory entry names, or nothing. A sweep over a root that does not
@@ -298,8 +500,62 @@ mod tests {
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
         blobs.write_chunk("u1", 1, b"def").unwrap();
-        blobs.commit("u1", HANDLE, "aa").unwrap();
+        blobs.commit("u1", HANDLE, "aa", 2, 6).unwrap();
         assert_eq!(blobs.read_snapshot(HANDLE, "aa").unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn commit_never_adopts_an_invalid_existing_destination() {
+        let (blobs, _dir) = blobs();
+        let digest = hex::encode(Sha256::digest(b"correct"));
+        blobs.begin_upload("u1").unwrap();
+        blobs.write_chunk("u1", 0, b"correct").unwrap();
+        blobs.commit("u1", HANDLE, &digest, 1, 7).unwrap();
+
+        std::fs::write(
+            blobs.snapshot_dir(HANDLE, &digest).join("0.part"),
+            b"corrupt",
+        )
+        .unwrap();
+        blobs.begin_upload("u2").unwrap();
+        blobs.write_chunk("u2", 0, b"correct").unwrap();
+
+        assert!(
+            blobs.commit("u2", HANDLE, &digest, 1, 7).is_err(),
+            "a corrupt destination displaced the verified upload"
+        );
+        assert!(
+            blobs.incoming_dir("u2").exists(),
+            "the verified upload was discarded"
+        );
+    }
+
+    #[test]
+    fn a_gapped_retained_directory_is_not_streamable() {
+        let (blobs, _dir) = blobs();
+        blobs.begin_upload("u1").unwrap();
+        blobs.write_chunk("u1", 0, b"abc").unwrap();
+        blobs.write_chunk("u1", 1, b"def").unwrap();
+        blobs.commit("u1", HANDLE, "aa", 2, 6).unwrap();
+        std::fs::remove_file(blobs.snapshot_dir(HANDLE, "aa").join("1.part")).unwrap();
+
+        assert!(matches!(
+            blobs.chunk_paths(HANDLE, "aa", 2, 6),
+            Err(Error::RetentionExpired)
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_io_failure_is_not_mislabeled_as_expired() {
+        let (blobs, _dir) = blobs();
+        let snapshot = blobs.snapshot_dir(HANDLE, "aa");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot, b"not a directory").unwrap();
+
+        assert!(matches!(
+            blobs.chunk_paths(HANDLE, "aa", 1, 1),
+            Err(Error::Internal(_))
+        ));
     }
 
     /// Two holders storing byte-identical snapshots keep two copies.
@@ -312,7 +568,7 @@ mod tests {
         for (upload, handle) in [("u1", HANDLE), ("u2", other)] {
             blobs.begin_upload(upload).unwrap();
             blobs.write_chunk(upload, 0, b"identical").unwrap();
-            blobs.commit(upload, handle, "aa").unwrap();
+            blobs.commit(upload, handle, "aa", 1, 9).unwrap();
         }
         assert_eq!(blobs.read_snapshot(HANDLE, "aa").unwrap(), b"identical");
         assert_eq!(blobs.read_snapshot(other, "aa").unwrap(), b"identical");
@@ -326,7 +582,7 @@ mod tests {
         let (blobs, _dir) = blobs();
         blobs.begin_upload("u1").unwrap();
         blobs.write_chunk("u1", 0, b"abc").unwrap();
-        blobs.commit("u1", HANDLE, "aa").unwrap();
+        blobs.commit("u1", HANDLE, "aa", 1, 3).unwrap();
         blobs.erase(HANDLE, "aa").unwrap();
         assert!(blobs.read_snapshot(HANDLE, "aa").is_err());
     }

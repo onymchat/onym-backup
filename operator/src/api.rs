@@ -49,6 +49,9 @@ pub struct AppState {
     pub documents: Documents,
     pub store: tokio::sync::Mutex<Store>,
     pub blobs: crate::blobs::Blobs,
+    /// Serialises mutations of committed snapshot directories with the
+    /// SQLite transitions that make those bytes live or erased.
+    pub blob_mutations: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -80,6 +83,7 @@ impl AppState {
             documents,
             store: tokio::sync::Mutex::new(store),
             blobs,
+            blob_mutations: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -393,7 +397,10 @@ mod tests {
     /// is somebody later adding a perfectly reasonable-looking check.
     #[test]
     fn the_export_path_cannot_consult_entitlements() {
-        let export = include_str!("export.rs");
+        let export = include_str!("export.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
         // Assembled from parts so this test does not match its own
         // source — the same trap the reassignment scan fell into.
         let forbidden = [
@@ -401,6 +408,10 @@ mod tests {
             format!("{}{}", "payment_", "required"),
             format!("{}{}", "lapse", "_state"),
             format!("{}{}", "requires_", "entitlement"),
+            // Export helpers live in the neutral blob module. Reaching
+            // into the upload module would make this one-call-deep scan
+            // bless a transitive path through paid preflight code.
+            format!("{}{}", "crate::", "uploads"),
         ];
         for needle in &forbidden {
             // Prose about *not* consulting them is the point of the

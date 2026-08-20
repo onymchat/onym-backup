@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::error::{Error, Result};
 
@@ -41,6 +41,10 @@ impl Store {
         self.connection.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
+            -- The blob layer syncs files and directory renames before
+            -- their rows commit; FULL makes the SQLite side of that
+            -- ordering equally explicit across power loss.
+            PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
 
             -- A snapshot's identity is the pair (holder, digest), never
@@ -273,9 +277,10 @@ impl Store {
 
     /// Drop nonces older than the retention bound.
     pub fn sweep_nonces(&self, older_than: &str) -> Result<usize> {
-        Ok(self
-            .connection
-            .execute("DELETE FROM seen_nonces WHERE seen_at < ?1", [older_than])?)
+        Ok(self.connection.execute(
+            "DELETE FROM seen_nonces WHERE julianday(seen_at) < julianday(?1)",
+            [older_than],
+        )?)
     }
 
     /// What this holder has retained, newest first.
@@ -295,17 +300,19 @@ impl Store {
 
     fn listed(&self, handle: &str, live_only: bool) -> Result<Vec<RetainedRow>> {
         let mut statement = self.connection.prepare(if live_only {
-            "SELECT digest, algorithm, sealed_byte_size, accepted_terms_id, supersedes,
-                    retained_at, retained_until, erased_at
-             FROM snapshots
-             WHERE holder_handle = ?1 AND erased_at IS NULL
-             ORDER BY retained_at DESC"
-        } else {
-            "SELECT digest, algorithm, sealed_byte_size, accepted_terms_id, supersedes,
+            "SELECT digest, algorithm, sealed_byte_size, chunk_count, accepted_terms_id, supersedes,
                     retained_at, retained_until, erased_at
              FROM snapshots
              WHERE holder_handle = ?1
-             ORDER BY retained_at DESC"
+               AND erased_at IS NULL
+               AND retained_until IS NULL
+             ORDER BY julianday(retained_at) DESC"
+        } else {
+            "SELECT digest, algorithm, sealed_byte_size, chunk_count, accepted_terms_id, supersedes,
+                    retained_at, retained_until, erased_at
+             FROM snapshots
+             WHERE holder_handle = ?1
+             ORDER BY julianday(retained_at) DESC"
         })?;
         let rows = statement
             .query_map([handle], |row| {
@@ -313,11 +320,12 @@ impl Store {
                     digest: row.get(0)?,
                     algorithm: row.get(1)?,
                     sealed_byte_size: row.get(2)?,
-                    accepted_terms_id: row.get(3)?,
-                    supersedes: row.get(4)?,
-                    retained_at: row.get(5)?,
-                    retained_until: row.get(6)?,
-                    erased_at: row.get(7)?,
+                    chunk_count: row.get(3)?,
+                    accepted_terms_id: row.get(4)?,
+                    supersedes: row.get(5)?,
+                    retained_at: row.get(6)?,
+                    retained_until: row.get(7)?,
+                    erased_at: row.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -329,7 +337,10 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(sealed_byte_size), 0)
-                 FROM snapshots WHERE holder_handle = ?1 AND erased_at IS NULL",
+                 FROM snapshots
+                 WHERE holder_handle = ?1
+                   AND erased_at IS NULL
+                   AND retained_until IS NULL",
                 [handle],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -418,12 +429,14 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (holder_handle, digest) DO UPDATE SET
                  erased_at         = NULL,
+                 retained_until    = NULL,
                  retained_at       = excluded.retained_at,
                  accepted_terms_id = excluded.accepted_terms_id,
                  supersedes        = excluded.supersedes,
                  sealed_byte_size  = excluded.sealed_byte_size,
                  chunk_count       = excluded.chunk_count
-             WHERE snapshots.erased_at IS NOT NULL",
+             WHERE snapshots.erased_at IS NOT NULL
+                OR snapshots.retained_until IS NOT NULL",
             rusqlite::params![
                 upload.holder_handle,
                 upload.digest,
@@ -471,7 +484,8 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(sealed_byte_size), 0) FROM uploads
-                 WHERE holder_handle = ?1 AND expires_at > ?2",
+                 WHERE holder_handle = ?1
+                   AND julianday(expires_at) > julianday(?2)",
                 rusqlite::params![handle, now],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -513,17 +527,90 @@ impl Store {
             .collect())
     }
 
-    /// Mark a snapshot erased. The row survives its bytes: `list` must
-    /// be able to answer `erased` rather than forgetting, and a holder
-    /// who asks about a digest they erased deserves better than a 404
-    /// that reads like it never existed.
-    pub fn mark_erased(&self, handle: &str, digest: &str, erased_at: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE snapshots SET erased_at = ?3
-             WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NULL",
-            rusqlite::params![handle, digest, erased_at],
+    /// One snapshot record in any state, for distinguishing an
+    /// unavailable snapshot from one this holder never stored.
+    pub fn snapshot_record(&self, handle: &str, digest: &str) -> Result<Option<RetainedRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT digest, algorithm, sealed_byte_size, chunk_count, accepted_terms_id,
+                    supersedes, retained_at, retained_until, erased_at
+             FROM snapshots WHERE holder_handle = ?1 AND digest = ?2",
         )?;
-        Ok(())
+        let mut rows = statement.query_map(rusqlite::params![handle, digest], |row| {
+            Ok(RetainedRow {
+                digest: row.get(0)?,
+                algorithm: row.get(1)?,
+                sealed_byte_size: row.get(2)?,
+                chunk_count: row.get(3)?,
+                accepted_terms_id: row.get(4)?,
+                supersedes: row.get(5)?,
+                retained_at: row.get(6)?,
+                retained_until: row.get(7)?,
+                erased_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Every row the operator currently claims has bytes, with the
+    /// holder partition needed to inspect its directory at startup.
+    pub fn all_live_snapshots(&self) -> Result<Vec<(String, RetainedRow)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT holder_handle, digest, algorithm, sealed_byte_size, chunk_count,
+                    accepted_terms_id, supersedes, retained_at, retained_until, erased_at
+             FROM snapshots
+             WHERE erased_at IS NULL AND retained_until IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                RetainedRow {
+                    digest: row.get(1)?,
+                    algorithm: row.get(2)?,
+                    sealed_byte_size: row.get(3)?,
+                    chunk_count: row.get(4)?,
+                    accepted_terms_id: row.get(5)?,
+                    supersedes: row.get(6)?,
+                    retained_at: row.get(7)?,
+                    retained_until: row.get(8)?,
+                    erased_at: row.get(9)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Stop claiming bytes are retained after the blob layer proves
+    /// they are absent or incomplete. The row remains so list and a
+    /// later erase can report `retention_expired` rather than pretend
+    /// the snapshot was never stored.
+    pub fn mark_unavailable(&self, handle: &str, digest: &str, at: &str) -> Result<usize> {
+        Ok(self.connection.execute(
+            "UPDATE snapshots SET retained_until = ?3
+             WHERE holder_handle = ?1 AND digest = ?2
+               AND erased_at IS NULL AND retained_until IS NULL",
+            rusqlite::params![handle, digest, at],
+        )?)
+    }
+
+    pub fn scope_is_unavailable(&self, handle: &str, scope: &str) -> Result<bool> {
+        let count: i64 = if scope == "all" {
+            self.connection.query_row(
+                "SELECT COUNT(*) FROM snapshots
+                 WHERE holder_handle = ?1 AND erased_at IS NULL
+                   AND retained_until IS NOT NULL",
+                [handle],
+                |row| row.get(0),
+            )?
+        } else {
+            self.connection.query_row(
+                "SELECT COUNT(*) FROM snapshots
+                 WHERE holder_handle = ?1 AND digest = ?2
+                   AND erased_at IS NULL AND retained_until IS NOT NULL",
+                rusqlite::params![handle, scope],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count > 0)
     }
 
     /// Mark erased, record the receipts, record the outcome — all or
@@ -589,32 +676,6 @@ impl Store {
             ],
         )?;
         transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn record_receipt(
-        &self,
-        receipt_id: &str,
-        handle: &str,
-        scope: &str,
-        terms_id: &str,
-        raw: &[u8],
-        covers: &[String],
-        issued_at: &str,
-    ) -> Result<()> {
-        self.connection.execute(
-            "INSERT OR REPLACE INTO erasure_receipts
-                (receipt_id, holder_handle, scope, terms_id, raw, issued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![receipt_id, handle, scope, terms_id, raw, issued_at],
-        )?;
-        for digest in covers {
-            self.connection.execute(
-                "INSERT OR IGNORE INTO receipt_snapshots (receipt_id, digest)
-                 VALUES (?1, ?2)",
-                rusqlite::params![receipt_id, digest],
-            )?;
-        }
         Ok(())
     }
 
@@ -728,7 +789,7 @@ impl Store {
     pub fn receipts(&self, handle: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut statement = self.connection.prepare(
             "SELECT receipt_id, raw FROM erasure_receipts
-             WHERE holder_handle = ?1 ORDER BY issued_at",
+             WHERE holder_handle = ?1 ORDER BY julianday(issued_at)",
         )?;
         let rows = statement.query_map([handle], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -760,7 +821,9 @@ impl Store {
     /// of those answers end with it.
     pub fn sweep_erased_references(&self, older_than: &str) -> Result<usize> {
         Ok(self.connection.execute(
-            "DELETE FROM snapshots WHERE erased_at IS NOT NULL AND erased_at < ?1",
+            "DELETE FROM snapshots
+             WHERE erased_at IS NOT NULL
+               AND julianday(erased_at) < julianday(?1)",
             [older_than],
         )?)
     }
@@ -784,8 +847,8 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let outcomes = transaction.execute(
             "DELETE FROM operation_outcomes
-             WHERE (status <> 'erased' AND recorded_at < ?1)
-                OR (status =  'erased' AND recorded_at < ?2)",
+             WHERE (status <> 'erased' AND julianday(recorded_at) < julianday(?1))
+                OR (status =  'erased' AND julianday(recorded_at) < julianday(?2))",
             rusqlite::params![uploads_before, receipts_before],
         )?;
         // Coverage first, while the receipts it points at still exist
@@ -793,40 +856,18 @@ impl Store {
         // readers until the receipt rows have gone too.
         transaction.execute(
             "DELETE FROM receipt_snapshots WHERE receipt_id IN (
-                 SELECT receipt_id FROM erasure_receipts WHERE issued_at < ?1
+                 SELECT receipt_id FROM erasure_receipts
+                  WHERE julianday(issued_at) < julianday(?1)
              )",
             [receipts_before],
         )?;
         let receipts = transaction.execute(
-            "DELETE FROM erasure_receipts WHERE issued_at < ?1",
+            "DELETE FROM erasure_receipts
+             WHERE julianday(issued_at) < julianday(?1)",
             [receipts_before],
         )?;
         transaction.commit()?;
         Ok((outcomes, receipts))
-    }
-
-    /// Was anything in this scope erased, receipts aside?
-    ///
-    /// The snapshot rows outlive the receipts, so this is what
-    /// separates "erased, and the receipt aged out" from "never held".
-    /// The first is `receipt_expired`; the second is a 404.
-    pub fn scope_was_erased(&self, handle: &str, scope: &str) -> Result<bool> {
-        let count: i64 = if scope == "all" {
-            self.connection.query_row(
-                "SELECT COUNT(*) FROM snapshots
-                 WHERE holder_handle = ?1 AND erased_at IS NOT NULL",
-                [handle],
-                |row| row.get(0),
-            )?
-        } else {
-            self.connection.query_row(
-                "SELECT COUNT(*) FROM snapshots
-                 WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NOT NULL",
-                rusqlite::params![handle, scope],
-                |row| row.get(0),
-            )?
-        };
-        Ok(count > 0)
     }
 
     /// A grant this holder already holds for this digest, if one is
@@ -848,8 +889,9 @@ impl Store {
             "SELECT upload_id, holder_handle, operation_id, digest, sealed_byte_size,
                     chunk_bytes, chunk_count, accepted_terms_id, supersedes, expires_at
              FROM uploads
-             WHERE holder_handle = ?1 AND digest = ?2 AND expires_at > ?3
-             ORDER BY expires_at DESC",
+             WHERE holder_handle = ?1 AND digest = ?2
+               AND julianday(expires_at) > julianday(?3)
+             ORDER BY julianday(expires_at) DESC",
         )?;
         let mut rows = statement.query_map(rusqlite::params![handle, digest, now], |row| {
             Ok(UploadRow {
@@ -870,25 +912,21 @@ impl Store {
 
     /// Upload ids whose grants have run out.
     pub fn expired_uploads(&self, now: &str) -> Result<Vec<String>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT upload_id FROM uploads WHERE expires_at <= ?1")?;
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id FROM uploads
+                 WHERE julianday(expires_at) <= julianday(?1)",
+        )?;
         let rows = statement.query_map([now], |row| row.get(0))?;
-        Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
-    }
-
-    pub fn all_upload_ids(&self) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare("SELECT upload_id FROM uploads")?;
-        let rows = statement.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
     }
 
     /// Every live snapshot as `(holder_handle, digest-hex)` — the shape
     /// the blob layer names them by, so the sweep can compare directly.
     pub fn all_retained_keys(&self) -> Result<Vec<(String, String)>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT holder_handle, digest FROM snapshots WHERE erased_at IS NULL")?;
+        let mut statement = self.connection.prepare(
+            "SELECT holder_handle, digest FROM snapshots
+                 WHERE erased_at IS NULL AND retained_until IS NULL",
+        )?;
         let rows = statement.query_map([], |row| {
             let handle: String = row.get(0)?;
             let digest: String = row.get(1)?;
@@ -912,7 +950,8 @@ impl Store {
     pub fn snapshot_exists(&self, handle: &str, digest: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM snapshots
-             WHERE holder_handle = ?1 AND digest = ?2 AND erased_at IS NULL",
+                 WHERE holder_handle = ?1 AND digest = ?2
+                   AND erased_at IS NULL AND retained_until IS NULL",
             rusqlite::params![handle, digest],
             |row| row.get(0),
         )?;
@@ -938,6 +977,7 @@ pub struct RetainedRow {
     pub digest: String,
     pub algorithm: String,
     pub sealed_byte_size: i64,
+    pub chunk_count: i64,
     pub accepted_terms_id: String,
     pub supersedes: Option<String>,
     pub retained_at: String,
@@ -1030,14 +1070,17 @@ mod tests {
             )
             .unwrap();
         store
-            .record_receipt(
-                "receipt",
-                "holder",
-                "sha256:old",
-                "terms",
-                br#"{"receiptId":"receipt"}"#,
-                &["sha256:old".into()],
-                "2026-01-01T00:00:00Z",
+            .connection
+            .execute_batch(
+                r#"
+                INSERT INTO erasure_receipts
+                    (receipt_id, holder_handle, scope, terms_id, raw, issued_at)
+                VALUES
+                    ('receipt', 'holder', 'sha256:old', 'terms',
+                     '{"receiptId":"receipt"}', '2026-01-01T00:00:00Z');
+                INSERT INTO receipt_snapshots (receipt_id, digest)
+                VALUES ('receipt', 'sha256:old');
+                "#,
             )
             .unwrap();
         store
@@ -1051,10 +1094,7 @@ mod tests {
 
         assert!(
             store
-                .sweep_outcomes_and_receipts(
-                    "2027-01-01T00:00:00Z",
-                    "2027-01-01T00:00:00Z"
-                )
+                .sweep_outcomes_and_receipts("2027-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
                 .is_err()
         );
         for table in [
@@ -1099,8 +1139,16 @@ mod tests {
     #[test]
     fn a_repeated_nonce_is_refused() {
         let store = Store::in_memory().unwrap();
-        assert!(store.record_nonce("h1", "n1", "2026-08-20T10:00:00Z").unwrap());
-        assert!(!store.record_nonce("h1", "n1", "2026-08-20T10:00:01Z").unwrap());
+        assert!(
+            store
+                .record_nonce("h1", "n1", "2026-08-20T10:00:00Z")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_nonce("h1", "n1", "2026-08-20T10:00:01Z")
+                .unwrap()
+        );
     }
 
     /// Nonce namespaces are per holder. Sharing one would let any
@@ -1108,8 +1156,16 @@ mod tests {
     #[test]
     fn nonces_do_not_collide_across_holders() {
         let store = Store::in_memory().unwrap();
-        assert!(store.record_nonce("h1", "same", "2026-08-20T10:00:00Z").unwrap());
-        assert!(store.record_nonce("h2", "same", "2026-08-20T10:00:00Z").unwrap());
+        assert!(
+            store
+                .record_nonce("h1", "same", "2026-08-20T10:00:00Z")
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_nonce("h2", "same", "2026-08-20T10:00:00Z")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1119,8 +1175,62 @@ mod tests {
         store.record_nonce("h1", "new", "2026-08-20T11:00:00Z").unwrap();
         assert_eq!(store.sweep_nonces("2026-08-20T10:00:00Z").unwrap(), 1);
         // The swept one is accepted again; the retained one is not.
-        assert!(store.record_nonce("h1", "old", "2026-08-20T11:00:01Z").unwrap());
-        assert!(!store.record_nonce("h1", "new", "2026-08-20T11:00:01Z").unwrap());
+        assert!(
+            store
+                .record_nonce("h1", "old", "2026-08-20T11:00:01Z")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_nonce("h1", "new", "2026-08-20T11:00:01Z")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn timestamp_ordering_is_chronological_not_lexical() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .begin_upload(
+                "u1",
+                "holder",
+                "op",
+                "sha256:aa",
+                3,
+                3,
+                1,
+                "terms",
+                None,
+                "2026-08-20T10:00:00Z",
+                "2026-08-20T10:00:20Z",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .open_grants("holder", "2026-08-20T10:00:20.5Z")
+                .unwrap(),
+            (0, 0),
+            "20Z sorted after the later 20.5Z"
+        );
+        assert_eq!(
+            store.expired_uploads("2026-08-20T10:00:20.5Z").unwrap(),
+            vec!["u1".to_string()]
+        );
+
+        store
+            .record_outcome(
+                "op",
+                "holder",
+                "sha256:aa",
+                "retained",
+                None,
+                "2026-08-20T10:00:20Z",
+            )
+            .unwrap();
+        let (outcomes, _) = store
+            .sweep_outcomes_and_receipts("2026-08-20T10:00:20.5Z", "2000-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(outcomes, 1);
     }
 
     #[test]

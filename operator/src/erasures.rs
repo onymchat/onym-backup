@@ -21,9 +21,9 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use time::format_description::well_known::Rfc3339;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::api::AppState;
 use crate::auth::authenticate;
@@ -59,6 +59,10 @@ pub async fn erase(
     let stamp = now
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
+    // Commit and erase both take this before the store lock. It closes
+    // the mark-erased → unlink window in which a re-upload could revive
+    // the row and then lose its newly committed directory.
+    let _blob_mutation = state.blob_mutations.lock().await;
 
     // Filled inside the locked section, used after it: the bytes are
     // unlinked once the bookkeeping has committed.
@@ -80,11 +84,14 @@ pub async fn erase(
             return Err(Error::BadRequest("operationId is required".into()));
         }
         if request.scope != "all" {
-            crate::uploads::digest_hex(&request.scope)?;
+            crate::blobs::digest_hex(&request.scope)?;
         }
 
         let targets = store.snapshots_in_scope(&holder.handle, &request.scope)?;
         if targets.is_empty() {
+            if store.scope_is_unavailable(&holder.handle, &request.scope)? {
+                return Err(Error::RetentionExpired);
+            }
             // Nothing live in scope. If these references were erased
             // before, the holder is owed the newest receipt set that
             // covers them. Scope equality alone is insufficient: the
@@ -124,8 +131,9 @@ pub async fn erase(
             // nothing.
             return Err(Error::NotFound(Resource::Snapshot));
         }
-        // Everything that can fail runs before anything is destroyed.
-        // Composing a receipt reads the pinned terms and can refuse —
+        // Everything that can leave the erasure undecided runs before
+        // anything is destroyed. Composing a receipt reads the pinned
+        // terms and can refuse —
         // terms with no completion deadline, for one — and doing that
         // after the bytes were gone left the holder erased, with no
         // receipt, and a retry answering `receipt_expired` about a
@@ -182,7 +190,7 @@ pub async fn erase(
         let who = holder.handle.clone();
         let doomed_hex = targets
             .iter()
-            .map(|row| crate::uploads::digest_hex(&row.digest))
+            .map(|row| crate::blobs::digest_hex(&row.digest))
             .collect::<Result<Vec<_>>>()?;
         (receipts, who, doomed_hex)
     };
@@ -196,10 +204,24 @@ pub async fn erase(
     //
     // Off the runtime thread. `remove_dir_all` over every chunk of
     // every snapshot is blocking I/O, and doing it on a runtime thread
-    // stalls the executor.
+    // stalls the executor. Cleanup is best-effort after the committed
+    // acknowledgement: failures are logged and retried by the orphan
+    // sweep, never turned into a false "operation failed" response.
     crate::uploads::blocking(&state, move |state| {
         for digest_hex in &doomed_hex {
-            state.blobs.erase(&who, digest_hex)?;
+            if let Err(error) = state.blobs.erase(&who, digest_hex) {
+                // The signed receipt and erased row are already
+                // committed. Returning 500 now would make a decided
+                // operation look unknown, and stopping would strand
+                // every later digest in an `all` scope. Continue; the
+                // orphan sweep retries any bytes that remain.
+                tracing::error!(
+                    %error,
+                    holder = %who,
+                    digest = %digest_hex,
+                    "could not unlink committed erasure"
+                );
+            }
         }
         Ok(())
     })
@@ -252,7 +274,9 @@ fn compose(
     })?;
     let acknowledged = OffsetDateTime::parse(acknowledged_at, &Rfc3339)
         .map_err(|e| Error::Internal(format!("unparseable stamp: {e}")))?;
-    let committed_by = (acknowledged + iso8601_days(deadline)?)
+    let committed_by = acknowledged
+        .checked_add(iso8601_days(deadline)?)
+        .ok_or_else(|| Error::Internal("erasure completion deadline is out of range".into()))?
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -286,17 +310,38 @@ fn iso8601_days(period: &str) -> Result<time::Duration> {
                 "completion deadline {period} is not a whole number of days"
             ))
         })?;
-    Ok(time::Duration::days(days))
+    if days <= 0 {
+        return Err(Error::Internal(format!(
+            "completion deadline {period} must be positive"
+        )));
+    }
+    let seconds = days
+        .checked_mul(24 * 60 * 60)
+        .ok_or_else(|| Error::Internal(format!("completion deadline {period} is too large")))?;
+    Ok(time::Duration::seconds(seconds))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::uploads::tests::Harness;
 
     use axum::http::StatusCode;
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn completion_deadlines_are_positive_and_bounded() {
+        assert!(iso8601_days("P-1D").is_err());
+        assert!(iso8601_days("P9223372036854775807D").is_err());
+
+        let large = iso8601_days("P100000000D").unwrap();
+        assert!(
+            OffsetDateTime::now_utc().checked_add(large).is_none(),
+            "the fixture no longer reaches the checked-add boundary"
+        );
+    }
 
     async fn erase(harness: &Harness, scope: &str) -> (StatusCode, Value) {
         erase_as(harness, scope, &uuid::Uuid::new_v4().to_string()).await
@@ -707,12 +752,15 @@ mod tests {
         let swept = tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    receipt: "2000-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                },
             )
         });
         assert_eq!(swept.orphan_snapshots, 0, "the sweep deleted a live snapshot");
@@ -851,13 +899,16 @@ mod tests {
         tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                // Every receipt is now past its window.
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    // Every receipt is now past its window.
+                    receipt: "2099-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                },
             )
         });
 
@@ -889,7 +940,13 @@ mod tests {
             .store
             .lock()
             .await
-            .record_receipt("r1", &harness.handle(), "all", "sha256:aa", &receipt, &[], "2026-01-01T00:00:00Z")
+            .connection_for_tests()
+            .execute(
+                "INSERT INTO erasure_receipts
+                    (receipt_id, holder_handle, scope, terms_id, raw, issued_at)
+                 VALUES ('r1', ?1, 'all', 'sha256:aa', ?2, '2026-01-01T00:00:00Z')",
+                rusqlite::params![harness.handle(), receipt],
+            )
             .unwrap();
 
         let (status, _) = harness.send("GET", "/v1/exports/receipts/r1", vec![]).await;
@@ -1035,12 +1092,15 @@ mod tests {
         tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2099-01-01T00:00:00Z",
+                    receipt: "2000-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                },
             )
         });
 
@@ -1079,6 +1139,17 @@ mod tests {
         erase(&harness, &held).await;
         let (status, _) = erase(&harness, &held).await;
         assert_eq!(status, StatusCode::OK, "erased with a live receipt");
+
+        // Erased, receipt expired, reference still remembered.
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .sweep_outcomes_and_receipts("2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z")
+            .unwrap();
+        let (status, _) = erase(&harness, &held).await;
+        assert_eq!(status, StatusCode::GONE, "erased with an expired receipt");
     }
 
     /// One request is acknowledged at one moment.
@@ -1192,6 +1263,48 @@ mod tests {
         assert_eq!(bytes, snapshot);
     }
 
+    #[tokio::test]
+    async fn unlink_failure_does_not_stop_the_rest_of_an_all_erasure() {
+        let harness = Harness::new(vec![]);
+        harness
+            .store_snapshot(&(0..20u8).collect::<Vec<u8>>())
+            .await;
+        harness
+            .store_snapshot(&(50..70u8).collect::<Vec<u8>>())
+            .await;
+
+        let targets = harness
+            .state
+            .store
+            .lock()
+            .await
+            .snapshots(&harness.handle())
+            .unwrap();
+        assert_eq!(targets.len(), 2);
+        let first_hex = crate::blobs::digest_hex(&targets[0].digest).unwrap();
+        let second_hex = crate::blobs::digest_hex(&targets[1].digest).unwrap();
+        let holder_root = harness
+            .state
+            .blobs
+            .root()
+            .join(&harness.handle()[..2])
+            .join(harness.handle());
+        let first_path = holder_root.join(first_hex);
+        std::fs::remove_dir_all(&first_path).unwrap();
+        std::fs::write(&first_path, b"cannot remove this with remove_dir_all").unwrap();
+
+        let (status, _) = erase(&harness, "all").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a committed erasure was relabeled as failed"
+        );
+        assert!(
+            !holder_root.join(second_hex).exists(),
+            "the first unlink failure stopped later snapshots"
+        );
+    }
+
     /// The sweep takes a receipt's coverage with it.
     ///
     /// Coverage rows name digests a holder erased. Left behind they
@@ -1218,12 +1331,15 @@ mod tests {
         tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    receipt: "2099-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                },
             )
         });
         assert_eq!(
@@ -1252,12 +1368,15 @@ mod tests {
         tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2099-01-01T00:00:00Z",
-                "2099-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    receipt: "2099-01-01T00:00:00Z",
+                    erased_reference: "2099-01-01T00:00:00Z",
+                },
             )
         });
 
@@ -1286,12 +1405,15 @@ mod tests {
         tokio::task::block_in_place(|| {
             crate::sweep::reconcile(
                 &harness.state.store,
+                &harness.state.blob_mutations,
                 &harness.state.blobs,
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
-                "2099-01-01T00:00:00Z",
-                "2000-01-01T00:00:00Z",
+                crate::sweep::Cutoffs {
+                    now: "2099-01-01T00:00:00Z",
+                    nonce: "2000-01-01T00:00:00Z",
+                    outcome: "2000-01-01T00:00:00Z",
+                    receipt: "2099-01-01T00:00:00Z",
+                    erased_reference: "2000-01-01T00:00:00Z",
+                },
             )
         });
 

@@ -148,30 +148,34 @@ async fn main() {
                     // up to 2x from first sight. Sweeping at 1x would
                     // drop it while still valid and reopen the replay
                     // the table closes.
-                    let floor = at - time::Duration::seconds(skew * 2);
-                    let outcomes = at - time::Duration::seconds(outcome_window);
-                    let receipts = at - time::Duration::seconds(receipt_window);
-                    let erased = at - time::Duration::seconds(erased_window);
-                    match (
-                        stamp(at),
-                        stamp(floor),
-                        stamp(outcomes),
-                        stamp(receipts),
-                        stamp(erased),
-                    ) {
-                        (Ok(now), Ok(floor), Ok(outcomes), Ok(receipts), Ok(erased)) => {
-                            Some(sweep::reconcile(
-                                &state.store,
-                                &state.blobs,
-                                &now,
-                                &floor,
-                                &outcomes,
-                                &receipts,
-                                &erased,
-                            ))
-                        }
-                        _ => None,
-                    }
+                    let stamped = (|| {
+                        let floor =
+                            at.checked_sub(time::Duration::seconds(skew.checked_mul(2)?))?;
+                        let outcomes = at.checked_sub(time::Duration::seconds(outcome_window))?;
+                        let receipts = at.checked_sub(time::Duration::seconds(receipt_window))?;
+                        let erased = at.checked_sub(time::Duration::seconds(erased_window))?;
+                        Some((
+                            stamp(at).ok()?,
+                            stamp(floor).ok()?,
+                            stamp(outcomes).ok()?,
+                            stamp(receipts).ok()?,
+                            stamp(erased).ok()?,
+                        ))
+                    })();
+                    stamped.map(|(now, floor, outcomes, receipts, erased)| {
+                        sweep::reconcile(
+                            &state.store,
+                            &state.blob_mutations,
+                            &state.blobs,
+                            sweep::Cutoffs {
+                                now: &now,
+                                nonce: &floor,
+                                outcome: &outcomes,
+                                receipt: &receipts,
+                                erased_reference: &erased,
+                            },
+                        )
+                    })
                 })
                 .await;
 
@@ -180,6 +184,7 @@ async fn main() {
                         if swept.expired_grants
                             + swept.orphan_incoming
                             + swept.orphan_snapshots
+                            + swept.unavailable_snapshots
                             + swept.spent_nonces
                             + swept.aged_outcomes
                             + swept.aged_receipts
@@ -190,6 +195,7 @@ async fn main() {
                                 expired_grants = swept.expired_grants,
                                 orphan_incoming = swept.orphan_incoming,
                                 orphan_snapshots = swept.orphan_snapshots,
+                                unavailable_snapshots = swept.unavailable_snapshots,
                                 spent_nonces = swept.spent_nonces,
                                 aged_outcomes = swept.aged_outcomes,
                                 aged_receipts = swept.aged_receipts,

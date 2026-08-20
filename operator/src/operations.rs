@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -26,21 +26,25 @@ use crate::error::{Error, Resource, Result};
 pub async fn query(
     State(state): State<Arc<AppState>>,
     Path(operation_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response> {
     let now = OffsetDateTime::now_utc();
-    let path = format!("/v1/operations/{operation_id}");
+    // Authenticate the request target the holder actually signed.
+    // Axum percent-decodes `Path`, which is correct for the database
+    // key but not for reconstructing a signature target such as
+    // `/v1/operations/op%201`.
+    let path = uri.path();
 
     let store = state.store.lock().await;
-    let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
+    let holder = authenticate(&headers, "GET", path, b"", &state.config, &store, now)?;
 
     // Scoped to the asking holder. The id is client-chosen, so an
     // unscoped lookup would let one holder read another's outcome by
     // guessing — and the ids are only as unguessable as the client
     // that minted them.
     let (subject, status, receipt_ids, recorded_at) = store
-        .outcome(&holder.handle, &operation_id)
-        .map_err(Error::from)?
+        .outcome(&holder.handle, &operation_id)?
         .ok_or(Error::NotFound(Resource::Operation))?;
 
     // Named for what the operation was about. An upload's subject is a
@@ -128,6 +132,34 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "operation_not_found");
+    }
+
+    #[tokio::test]
+    async fn a_percent_encoded_operation_id_can_be_reconciled() {
+        let harness = Harness::new(vec![]);
+        for (operation_id, encoded) in [("op 1", "op%201"), ("op/1", "op%2F1")] {
+            harness
+                .state
+                .store
+                .lock()
+                .await
+                .record_outcome(
+                    operation_id,
+                    &harness.handle(),
+                    "sha256:aa",
+                    "retained",
+                    None,
+                    "2026-01-01T00:00:00Z",
+                )
+                .unwrap();
+
+            let (status, body) = harness
+                .send("GET", &format!("/v1/operations/{encoded}"), vec![])
+                .await;
+            assert_eq!(status, StatusCode::OK, "{operation_id}");
+            let outcome: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(outcome["outcome"]["operationId"], operation_id);
+        }
     }
 
     /// The id is client-chosen, so an unscoped lookup would let one

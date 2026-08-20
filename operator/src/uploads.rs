@@ -7,15 +7,16 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::api::AppState;
 use crate::auth::authenticate;
+use crate::blobs::{digest_hex, snapshot_stream};
 use crate::error::{Error, Resource, Result};
 
 #[derive(Deserialize)]
@@ -67,12 +68,11 @@ pub struct UploadGrant {
 /// The order of the checks matters and three of them are
 /// counterintuitive:
 ///
-/// 1. **grant resume — ahead of the terms check.** A holder halfway
-///    through an upload when the operator publishes new terms would
-///    otherwise be refused at (2) and never reach resume, stranding
-///    their grant against the quota until it expires. The grant is
-///    itself the record of consent to the terms it was minted under,
-///    and the request must carry *those* terms to resume it.
+/// 1. **grant resume — ahead of terms and payment.** A holder halfway
+///    through an upload when terms change or a paid seat lapses would
+///    otherwise never reach resume, stranding a grant the operator
+///    already issued against the quota until it expires. The grant is
+///    itself the bounded obligation and consent record.
 /// 2. `terms_changed` — nothing new may be pinned to terms nobody
 ///    agreed to.
 /// 3. `payment_required` — before any bytes move.
@@ -134,19 +134,12 @@ pub async fn preflight(
 
     // (1) A grant this holder already has for this digest, resumed.
     //
-    // Ahead of the terms check, not after it. A holder halfway through
-    // an upload when the operator publishes new terms would otherwise
-    // be refused at (2) and never reach resume: their grant strands
-    // against the quota until it expires, which is the harm resume
-    // exists to prevent, arriving by the one route that cannot be
-    // retried out of. The grant is itself the record of consent to the
-    // terms it was minted under, and terms bind forward — a snapshot
-    // accepted under T1 keeps T1 — so finishing that upload under T1 is
-    // what the pinning already promises.
+    // Ahead of terms and payment, not after them. The grant is an
+    // obligation already accepted under the terms and entitlement
+    // state at minting, and its original expiry is never extended.
+    // Finishing those in-flight bytes is the bounded promise; only a
+    // new grant reaches the current terms and payment gates.
     //
-    // The `accepted_terms_id` condition is what keeps this narrow: the
-    // request must carry the *grant's* terms, so this resumes an agreed
-    // upload and is never a route around consent.
     if let Some(open) = store.open_grant_for(&holder.handle, &reference.digest, &now_stamp)? {
         // Any live grant, not only one whose terms match the request.
         // A condition on matching terms is not a narrowing, it is a
@@ -174,6 +167,12 @@ pub async fn preflight(
                 "sealedByteSize disagrees with the open grant for this digest".into(),
             ));
         }
+        // Keep the operation id that minted the grant. The companion
+        // profile explicitly excludes an uncommitted grant from §9.8:
+        // a lost grant response is reconciled by re-preflight, which
+        // returns this grant; after commit, the original client-chosen
+        // id reconciles the durable outcome. Re-keying it on every
+        // retry would instead make the first known id go dark.
         let (_, missing) = state.blobs.arrival(&open.upload_id, open.chunk_count)?;
         return Ok(axum::Json(UploadGrant {
             upload_id: open.upload_id,
@@ -421,6 +420,11 @@ pub async fn commit(
         .format(&Rfc3339)
         .map_err(|e| Error::Internal(e.to_string()))?;
     {
+        // Serialises the destination-directory mutation with erasure
+        // and orphan cleanup. Without it, erasure could mark the row,
+        // a commit could revive it, and the pending unlink could then
+        // remove the newly retained bytes.
+        let _blob_mutation = state.blob_mutations.lock().await;
         // Quota is re-checked here, under the lock, with the rename
         // inside it. The preflight check is against a count that had
         // not moved yet; this one is against the count that decides.
@@ -442,7 +446,7 @@ pub async fn commit(
             let open_grants = (open_grants - 1).max(0);
             let open_grant_bytes = (open_grant_bytes - upload.sealed_byte_size).max(0);
             if retained >= state.config.maximum_retained_snapshots {
-                state.blobs.discard_upload(&upload_id);
+                state.blobs.discard_upload(&upload_id)?;
                 store.drop_upload(&upload_id)?;
                 return Err(Error::QuotaExceeded {
                     retained_snapshots: retained,
@@ -455,9 +459,13 @@ pub async fn commit(
                 });
             }
         }
-        state
-            .blobs
-            .commit(&upload_id, &upload.holder_handle, &digest_hex)?;
+        state.blobs.commit(
+            &upload_id,
+            &upload.holder_handle,
+            &digest_hex,
+            upload.chunk_count,
+            upload.sealed_byte_size,
+        )?;
         store.retain(&upload, &retained_at)?;
         store.drop_upload(&upload_id)?;
         store.record_outcome(
@@ -501,7 +509,7 @@ where
 
 /// Give up on an upload: bytes first, then the row.
 async fn abandon(state: &Arc<AppState>, upload_id: &str) -> Result<()> {
-    state.blobs.discard_upload(upload_id);
+    state.blobs.discard_upload(upload_id)?;
     state.store.lock().await.drop_upload(upload_id)
 }
 
@@ -528,6 +536,13 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     let body: Vec<_> = rows
         .into_iter()
         .map(|row| {
+            let status = if row.erased_at.is_some() {
+                "erased"
+            } else if row.retained_until.is_some() {
+                "retention_expired"
+            } else {
+                "retained"
+            };
             json!({
                 "snapshotReference": {
                     "referenceVersion": 1,
@@ -540,7 +555,7 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
                 "retainedUntil": row.retained_until,
                 "supersedes": row.supersedes,
                 "erasedAt": row.erased_at,
-                "status": if row.erased_at.is_some() { "erased" } else { "retained" },
+                "status": status,
             })
         })
         .collect();
@@ -556,7 +571,7 @@ pub async fn download(
     let path = format!("/v1/snapshots/{digest_path}");
     let digest = format!("sha256:{digest_path}");
 
-    let holder = {
+    let (holder, row) = {
         let store = state.store.lock().await;
         let holder = authenticate(&headers, "GET", &path, b"", &state.config, &store, now)?;
         // Shape-checked as well as looked up. The database lookup would
@@ -564,45 +579,55 @@ pub async fn download(
         // but the path segment reaches the filesystem and should not
         // depend on that for its safety.
         digest_hex(&digest)?;
-        if !store.snapshot_exists(&holder.handle, &digest)? {
+        let row = store.snapshot_record(&holder.handle, &digest)?;
+        let Some(row) = row else {
             // Not "this holder cannot see it" versus "it does not
             // exist" — the same answer either way, because
             // distinguishing them would tell one holder whether another
             // holds a given digest.
             return Err(Error::NotFound(Resource::Snapshot));
+        };
+        if row.erased_at.is_some() {
+            return Err(Error::NotFound(Resource::Snapshot));
         }
-        holder
+        if row.retained_until.is_some() {
+            return Err(Error::RetentionExpired);
+        }
+        (holder, row)
     };
 
     // Streamed, not buffered. A snapshot is routinely hundreds of
     // megabytes; reading one into a `Vec` per concurrent download would
     // make a handful of readers enough to exhaust memory.
-    let paths = state.blobs.chunk_paths(&holder.handle, &digest_path)?;
+    let paths = match state.blobs.chunk_paths(
+        &holder.handle,
+        &digest_path,
+        row.chunk_count,
+        row.sealed_byte_size,
+    ) {
+        Ok(paths) => paths,
+        Err(Error::RetentionExpired) => {
+            let unavailable_at = now
+                .format(&Rfc3339)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            state
+                .store
+                .lock()
+                .await
+                .mark_unavailable(&holder.handle, &digest, &unavailable_at)?;
+            return Err(Error::RetentionExpired);
+        }
+        Err(error) => return Err(error),
+    };
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/octet-stream")],
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, row.sealed_byte_size.to_string()),
+        ],
         axum::body::Body::from_stream(snapshot_stream(paths)),
     )
         .into_response())
-}
-
-/// The snapshot's bytes, chunk by chunk, a bounded buffer at a time.
-pub fn snapshot_stream(
-    paths: Vec<std::path::PathBuf>,
-) -> impl futures_core::Stream<Item = std::io::Result<Bytes>> {
-    async_stream::try_stream! {
-        for path in paths {
-            let mut file = tokio::fs::File::open(&path).await?;
-            let mut buffer = vec![0u8; 256 * 1024];
-            loop {
-                let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-                yield Bytes::copy_from_slice(&buffer[..read]);
-            }
-        }
-    }
 }
 
 /// Has a grant run out?
@@ -617,27 +642,10 @@ fn has_expired(expires_at: &str, now: OffsetDateTime) -> Result<bool> {
     Ok(expiry <= now)
 }
 
-/// `sha256:<64 lowercase hex>` → the hex, or a refusal.
-pub fn digest_hex(digest: &str) -> Result<String> {
-    let hex_value = digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| Error::BadRequest("digest must be sha256:<hex>".into()))?;
-    if hex_value.len() != 64
-        || !hex_value
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(Error::BadRequest(
-            "digest must be 64 lowercase hex characters".into(),
-        ));
-    }
-    Ok(hex_value.to_string())
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::api::{router, AppState};
+    use crate::api::{AppState, router};
     use crate::auth;
     use crate::config::Config;
     use crate::documents::Documents;
@@ -865,6 +873,46 @@ pub mod tests {
         assert!(error["paymentRequired"].get("price").is_none(), "a price appeared in a refusal");
     }
 
+    #[tokio::test]
+    async fn a_paid_operator_honours_a_grant_it_already_issued() {
+        let harness = Harness::new(vec!["onym:key:broker".into()]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        let terms = harness.terms_id();
+        let body = harness.preflight_body(&snapshot, &terms);
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let digest = request["snapshotReference"]["digest"].as_str().unwrap();
+        let operation = request["operationId"].as_str().unwrap();
+        harness
+            .state
+            .store
+            .lock()
+            .await
+            .begin_upload(
+                "existing-grant",
+                &harness.handle(),
+                operation,
+                digest,
+                snapshot.len() as i64,
+                8,
+                3,
+                &terms,
+                None,
+                "2026-01-01T00:00:00Z",
+                "2999-01-01T00:00:00Z",
+            )
+            .unwrap();
+        harness.state.blobs.begin_upload("existing-grant").unwrap();
+
+        let (status, response) = harness.send("POST", "/v1/preflight", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "payment was applied retroactively to an issued grant"
+        );
+        let grant: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(grant["uploadId"], "existing-grant");
+    }
+
     /// One holder must not be able to write into another's upload, even
     /// knowing the id.
     #[tokio::test]
@@ -1062,6 +1110,38 @@ pub mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(bytes.len(), snapshot.len());
         assert_eq!(bytes, snapshot, "the streamed bytes came back changed");
+    }
+
+    #[tokio::test]
+    async fn a_gapped_snapshot_is_never_served_as_a_success() {
+        let harness = Harness::new(vec![]);
+        let snapshot: Vec<u8> = (0..20u8).collect();
+        harness.store_snapshot(&snapshot).await;
+        let hex = hex::encode(Sha256::digest(&snapshot));
+        let path = harness
+            .state
+            .blobs
+            .root()
+            .join(&harness.handle()[..2])
+            .join(harness.handle())
+            .join(&hex)
+            .join("1.part");
+        std::fs::remove_file(path).unwrap();
+
+        for route in [format!("/v1/snapshots/{hex}"), format!("/v1/exports/{hex}")] {
+            let (status, _) = harness.send("GET", &route, vec![]).await;
+            assert_eq!(
+                status,
+                StatusCode::GONE,
+                "{route} served incomplete bytes as a success"
+            );
+        }
+        let (_, body) = harness.send("GET", "/v1/snapshots", vec![]).await;
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            listed[0]["status"], "retention_expired",
+            "list still claimed corrupt bytes were retained"
+        );
     }
 
     /// A refusal a client cannot act on is a refusal that will be

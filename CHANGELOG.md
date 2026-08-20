@@ -64,6 +64,18 @@ enrolment, and this file exists so the boundary is visible when it arrives.
 
 ### Fixed
 
+- Retention windows that cannot be represented are refused at boot instead of
+  panicking the hourly sweep, and RFC 3339 values are compared as timestamps
+  rather than strings.
+- Retained blobs are checked for contiguous chunks and their declared byte size
+  before download or export; incomplete rows are marked
+  `retention_expired`, never reported as retained. Commits no longer adopt an
+  existing destination until its digest is verified.
+- Chunk files and directory mutations are synced before SQLite records them;
+  commit, erase, and orphan cleanup serialize destination changes so a
+  concurrent re-upload cannot be unlinked by an erasure.
+- Operation reconciliation authenticates the original percent-encoded request
+  target, and every terms entry in an export carries its own fetchable URL.
 - Existing stores migrate `operation_outcomes.digest` to `subject` and add
   `receiptIds` without losing previously recorded outcomes.
 - Erasure replay chooses the newest receipt set across exact scopes and stored
